@@ -130,8 +130,17 @@ async def init_db() -> None:
     """
     # Импортируем модели для регистрации в metadata
     # (необходимо до вызова create_all)
-    from modules.multi.models import account, account_lot  # noqa: F401
+    from modules.multi.models.account import Account          # noqa: F401
+    from modules.multi.models.account_lot import AccountLot  # noqa: F401
 
+    # ── НОВЫЕ ИМПОРТЫ МОДУЛЯ 5 ──────────────────────────────
+    from modules.stats.models.stats_daily import StatsDaily              # noqa: F401
+    from modules.stats.models.balance_history import BalanceHistory      # noqa: F401
+    from modules.balance.models.balance_alert import BalanceAlert        # noqa: F401
+    from modules.balance.models.delayed_delivery import DelayedDelivery  # noqa: F401
+    from modules.emergency.models.emergency_pause import EmergencyPause  # noqa: F401
+    from modules.updates.models.update_check import UpdateCheck          # noqa: F401
+    
     engine = _get_engine()
     try:
         async with engine.begin() as conn:
