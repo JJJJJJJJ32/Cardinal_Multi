@@ -1,18 +1,18 @@
 """
-main.py — точка входа Cardinal_Multi.
+Cardinal_Multi — точка входа.
 
-Порядок запуска:
-    1. Инициализация логгера (loguru → файл)
-    2. Загрузка настроек из .env
-    3. Инициализация шифрования
-    4. Инициализация БД (создание таблиц)
-    5. Проверка совместимости с плагинами Cardinal
-    6. Запуск AccountManager
-    7. Запуск Rich-дашборда
-    8. Ожидание Ctrl+C
-    9. Корректное завершение
-
-Ничего из Cardinal не изменяется.
+Pipeline запуска:
+1. sys.path setup
+2. Логгер (предварительный)
+3. Настройки (.env)
+4. Логгер (финальный с уровнем из .env)
+5. Encryption (инициализация ключа)
+6. init_db (создание всех таблиц)
+7. Совместимость плагинов Cardinal
+8. AccountManager (Модуль 1)
+9. LolzteamModule (Модуль 2)
+10. Cardinal Bridge (подключение хуков к Cardinal)
+11. Rich dashboard / ожидание Ctrl+C
 """
 
 from __future__ import annotations
@@ -21,133 +21,154 @@ import asyncio
 import sys
 from pathlib import Path
 
-# ─── Добавляем корень проекта в sys.path ──────────────────────────────────────
-_root = Path(__file__).parent
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
+# ── 1. sys.path ──────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# ── 2. Логгер (предварительный) ──────────────────────────────────
+from modules.core.logger import setup_logger
+
+setup_logger("DEBUG")
+
+# ── 3. Настройки ─────────────────────────────────────────────────
+from modules.core.config import get_settings
+
+settings = get_settings()
+
+# ── 4. Логгер (финальный) ────────────────────────────────────────
+setup_logger(settings.log_level)
+
+from loguru import logger
+
+logger.info("Cardinal_Multi запускается...")
+
+# ── 5. Encryption ────────────────────────────────────────────────
+from modules.core.encryption import Encryption
+
+Encryption()  # инициализация ключа (создаст data/secret.key если нет)
+logger.info("Encryption инициализирован")
+
+# ── 6. База данных ───────────────────────────────────────────────
+from modules.core.database import init_db
+
+# ── 7. Совместимость плагинов ────────────────────────────────────
+from modules.cardinal_bridge.compatibility import check_all_plugins
+
+# ── 8. AccountManager ────────────────────────────────────────────
+from modules.multi.account_manager import AccountManager
+
+# ── 9. LolzteamModule ────────────────────────────────────────────
+from modules.lolzteam import LolzteamModule
+
+# ── 10. Cardinal Bridge ──────────────────────────────────────────
+from modules.cardinal_bridge.hooks import generate_plugin_file
+
+# ── UI ───────────────────────────────────────────────────────────
+from ui.console import ConsoleUI
 
 
 async def main() -> None:
-    """Главная async-функция Cardinal_Multi."""
+    """Основная точка входа Cardinal_Multi."""
 
-    # ── 1. Logger ─────────────────────────────────────────────────────────────
-    from modules.core.logger import setup_logger
-    from modules.core.config import get_settings
+    # ── БД: создать все таблицы ──────────────────────────────────
+    logger.info("Инициализация базы данных...")
+    await init_db()
+    logger.info("База данных готова")
 
-    # Временно инициализируем с DEBUG до загрузки настроек
-    setup_logger("DEBUG")
-
-    from loguru import logger
-    logger.info("=" * 60)
-    logger.info("Cardinal_Multi v1.0.0 — запуск")
-    logger.info("=" * 60)
-
-    # ── 2. Настройки ──────────────────────────────────────────────────────────
-    from ui.console import console, show_error, show_info
-
+    # ── Совместимость плагинов Cardinal ──────────────────────────
+    logger.info("Проверка совместимости плагинов...")
     try:
-        settings = get_settings()
-        # Переинициализируем логгер с правильным уровнем
-        setup_logger(settings.log_level)
-        show_info("Настройки загружены.")
-    except SystemExit as exc:
-        show_error(
-            str(exc),
-            hint="Запусти setup.py для первоначальной настройки: python setup.py",
-        )
-        sys.exit(1)
+        check_all_plugins()
+    except Exception as exc:
+        logger.warning(f"Проверка совместимости: {exc}")
 
-    # ── 3. Шифрование ─────────────────────────────────────────────────────────
-    from modules.core.encryption import Encryption, EncryptionError
+    # ── Cardinal Bridge: генерация plugin-файла ───────────────────
+    logger.info("Генерация Cardinal bridge плагина...")
     try:
-        Encryption()  # инициализация (создаёт ключ если нет)
-        show_info("Шифрование инициализировано.")
-    except EncryptionError as exc:
-        show_error(f"Ошибка шифрования: {exc}")
-        sys.exit(1)
+        generate_plugin_file()
+        logger.info("Cardinal bridge плагин готов")
+    except Exception as exc:
+        logger.warning(f"Cardinal bridge: {exc}")
 
-    # ── 4. БД ─────────────────────────────────────────────────────────────────
-    from modules.core.database import init_db, close_db
+    # ── Модуль 1: AccountManager ──────────────────────────────────
+    logger.info("Запуск AccountManager...")
+    account_manager = AccountManager()
     try:
-        await init_db()
-        show_info("База данных готова.")
-    except RuntimeError as exc:
-        show_error(
-            str(exc),
-            hint="Проверь права на папку data/ и попробуй снова.",
-        )
-        sys.exit(1)
+        await account_manager.setup()
+        await account_manager.start()
+        logger.info("AccountManager запущен")
+    except Exception as exc:
+        logger.error(f"AccountManager ошибка: {exc}", exc_info=True)
+        # Не падаем — продолжаем запуск
 
-    # ── 5. Совместимость с плагинами Cardinal ─────────────────────────────────
-    from modules.cardinal_bridge.compatibility import (
-        check_all_plugins,
-        log_compatibility_report,
+    # ── Модуль 2: LolzteamModule ──────────────────────────────────
+    lolzteam_module: LolzteamModule | None = None
+
+    # Проверяем есть ли хоть один из Lolzteam credentials
+    lolz_token = (
+        getattr(settings, "lolz_api_token", None)
+        or getattr(settings, "lolzteam_token", None)
     )
-    compat_results = check_all_plugins()
-    log_compatibility_report(compat_results)
+    lolz_login = getattr(settings, "lolz_login", None)
+    lolz_password = getattr(settings, "lolz_password", None)
 
-    # ── 6. Генерируем плагин-мост для основного Cardinal ─────────────────────
-    from modules.cardinal_bridge.hooks import generate_plugin_file
-    try:
-        generate_plugin_file(account_id=1)
-        show_info("Плагин-мост Cardinal создан (plugins/cardinal_multi_bridge.py).")
-    except Exception as exc:
-        logger.warning("Не удалось создать плагин-мост: {}", exc)
-
-    # ── 7. AccountManager ─────────────────────────────────────────────────────
-    from modules.multi.account_manager import AccountManager
-
-    manager = AccountManager()
-
-    try:
-        await manager.setup()
-        show_info(f"AccountManager инициализирован.")
-    except Exception as exc:
-        show_error(
-            f"Ошибка инициализации AccountManager: {exc}",
-            hint="Проверь логи: logs/cardinal_multi.log",
-        )
-        sys.exit(1)
-
-    try:
-        await manager.start()
-    except Exception as exc:
-        show_error(
-            f"Ошибка запуска аккаунтов: {exc}",
-            hint="Проверь golden_key аккаунтов в настройках.",
-        )
-        await close_db()
-        sys.exit(1)
-
-    # ── 8. Дашборд + ожидание ─────────────────────────────────────────────────
-    from ui.console import run_dashboard
-
-    try:
-        # Запускаем дашборд как задачу
-        dashboard_task = asyncio.create_task(
-            run_dashboard(manager),
-            name="cardinal_multi_dashboard",
-        )
-
-        # Ждём Ctrl+C
-        await dashboard_task
-
-    except KeyboardInterrupt:
-        pass
-    except Exception as exc:
-        logger.error("Критическая ошибка: {}", exc)
-    finally:
-        # ── 9. Корректное завершение ──────────────────────────────────────────
-        console.print("\n[bold yellow]Остановка Cardinal_Multi...[/bold yellow]")
-
+    if lolz_token or (lolz_login and lolz_password):
+        logger.info("Запуск LolzteamModule...")
+        lolzteam_module = LolzteamModule()
         try:
-            await manager.stop()
+            await lolzteam_module.setup()
+            await lolzteam_module.start()
+            logger.info("LolzteamModule запущен")
         except Exception as exc:
-            logger.error("Ошибка при остановке менеджера: {}", exc)
+            logger.error(
+                f"LolzteamModule ошибка: {exc}", exc_info=True
+            )
+            lolzteam_module = None
+    else:
+        logger.warning(
+            "LolzteamModule не запущен: "
+            "не задан LOLZ_API_TOKEN или LOLZ_LOGIN + LOLZ_PASSWORD"
+        )
 
-        await close_db()
-        logger.info("Cardinal_Multi завершён.")
-        console.print("[bold green]Завершено.[/bold green]")
+    # ── UI / ожидание ─────────────────────────────────────────────
+    logger.info("Cardinal_Multi запущен. Нажми Ctrl+C для остановки.")
+
+    ui = ConsoleUI()
+    try:
+        await ui.run(
+            account_manager=account_manager,
+            lolzteam_module=lolzteam_module,
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Получен сигнал остановки...")
+    finally:
+        await _shutdown(account_manager, lolzteam_module)
+
+
+async def _shutdown(
+    account_manager: AccountManager,
+    lolzteam_module: LolzteamModule | None,
+) -> None:
+    """Корректная остановка всех модулей."""
+    logger.info("Остановка Cardinal_Multi...")
+
+    # Lolzteam
+    if lolzteam_module is not None:
+        try:
+            await lolzteam_module.stop()
+            logger.info("LolzteamModule остановлен")
+        except Exception as exc:
+            logger.error(f"LolzteamModule stop ошибка: {exc}")
+
+    # AccountManager
+    try:
+        await account_manager.stop()
+        logger.info("AccountManager остановлен")
+    except Exception as exc:
+        logger.error(f"AccountManager stop ошибка: {exc}")
+
+    logger.info("Cardinal_Multi остановлен")
 
 
 if __name__ == "__main__":
