@@ -66,3 +66,5 @@ playwright>=1.40.0
 # Типизация для Python < 3.11
 # (аннотации типов в runtime)
 typing-extensions>=4.8.0
+
+cachetools>=5.3.0
