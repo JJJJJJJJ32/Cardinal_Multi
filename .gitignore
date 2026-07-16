@@ -1,0 +1,50 @@
+# ─── Секреты Cardinal_Multi ──────────────────────────────
+.env
+data/secret.key
+data/cardinal_multi.db
+
+# ─── Данные аккаунтов ─────────────────────────────────────
+data/accounts/*/configs/_main.cfg
+data/accounts/
+
+# ─── Логи ─────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── Cardinal оригинальные данные ─────────────────────────
+storage/
+configs/_main.cfg
+
+# ─── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+pip-wheel-metadata/
+.eggs/
+
+# ─── Virtual environment ───────────────────────────────────
+venv/
+env/
+.venv/
+.env/
+
+# ─── IDE ───────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Playwright ────────────────────────────────────────────
+playwright/.local-browsers/
+
+# ─── Alembic ───────────────────────────────────────────────
+# migrations/ не игнорируем — нужны в репозитории
