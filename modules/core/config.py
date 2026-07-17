@@ -49,8 +49,11 @@ class MultiSettings(BaseSettings):
     # ── Логирование ───────────────────────────────────────────────────────────
     log_level: str = Field(
         default="INFO",
-        validation_alias=AliasChoices("LOG_LEVEL"),
-        description="Уровень логирования: DEBUG | INFO | WARNING | ERROR | CRITICAL",
+        description=(
+            "Уровень логирования. "
+            "Допустимые значения: DEBUG, INFO, WARNING, ERROR, CRITICAL. "
+            "DEBUG содержит чувствительные данные — НЕ используй в продакшене."
+        ),
     )
 
     # ── Мультиаккаунты ────────────────────────────────────────────────────────

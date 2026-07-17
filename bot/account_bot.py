@@ -34,7 +34,12 @@ async def run_account_bot(account_id: int, token: str, owner_chat_id: int) -> No
     dp = Dispatcher(storage=storage)
 
     # Middleware
-    dp.update.middleware(AuthMiddleware(allowed_ids=[owner_chat_id]))
+    dp.update.middleware(
+        AuthMiddleware(
+            allowed_user_ids=[owner_chat_id],
+            allowed_chat_ids=[owner_chat_id],
+        )
+    )
     dp.message.middleware(ThrottlingMiddleware(rate_limit=1.0))
     dp.callback_query.middleware(ThrottlingMiddleware(rate_limit=1.0))
 

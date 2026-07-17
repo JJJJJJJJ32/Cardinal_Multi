@@ -416,7 +416,15 @@ async def run_main_bot(account_manager: AccountManager) -> None:
 
     # Middleware
     allowed_ids = [int(settings.main_telegram_chat_id)]
-    dp.update.middleware(AuthMiddleware(allowed_ids=allowed_ids))
+    
+    owner_id = int(settings.main_telegram_chat_id)
+    dp.update.middleware(
+    AuthMiddleware(
+        allowed_user_ids=[owner_id],  # для личного чата
+        allowed_chat_ids=[owner_id],  # совпадает в private, отличается в группе
+        )
+    )
+
     dp.message.middleware(ThrottlingMiddleware(rate_limit=1.0))
     dp.callback_query.middleware(ThrottlingMiddleware(rate_limit=1.0))
 

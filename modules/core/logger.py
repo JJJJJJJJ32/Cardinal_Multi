@@ -1,47 +1,98 @@
 """
 modules/core/logger.py
-─────────────────────
-Настройка loguru-логгера для Cardinal_Multi.
-Пишет ТОЛЬКО в файл. В консоль — только rich (через ui/console.py).
-Стандартный logging Cardinal не затрагивается.
+Безопасная инициализация loguru.
+
+ИЗМЕНЕНИЯ (security fix):
+  - diagnose/backtrace управляются через env (default=False)
+  - уровень перехвата std logging = log_level (не forced DEBUG)
+  - patcher редактирует токены/ключи до записи в файл
+  - права на logs/ = 0700, лог-файл = 0600
+  - шумные библиотеки прижаты до WARNING
 """
 
 from __future__ import annotations
 
-import sys
 import logging
+import os
+import re
+import sys
 from pathlib import Path
+from typing import Any, Pattern
+
 from loguru import logger
 
-# ─── Константы ────────────────────────────────────────────────────────────────
+# ─── Пути ───────────────────────────────────────────────────────────────────
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "cardinal_multi.log"
-ROTATION = "00:00"          # ротация в полночь
-RETENTION = "30 days"       # хранить 30 дней
-COMPRESSION = "zip"         # сжимать старые логи
+
+# ─── Формат ─────────────────────────────────────────────────────────────────
 LOG_FORMAT = (
-    "<green>{time:DD.MM.YYYY HH:mm:ss}</green> | "
+    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
-    "<cyan>{name}</cyan>:<cyan>{line}</cyan> | "
-    "{message}"
+    "{extra[name]} | "
+    "<cyan>{module}</cyan>:<cyan>{line}</cyan> - "
+    "<level>{message}</level>"
 )
+
+ROTATION    = "10 MB"
+RETENTION   = "30 days"
+COMPRESSION = "zip"
+
+# ─── Паттерны для редактирования секретов ────────────────────────────────────
+_SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # golden_key=..., token=..., Authorization: Bearer ...
+    (
+        re.compile(
+            r"(?i)\b(golden_key|token|authorization|cookie|api_key|secret)\b"
+            r"(\s*[:=]\s*)([^\s'\";,&]{4,})",
+            re.IGNORECASE,
+        ),
+        r"\1\2[REDACTED]",
+    ),
+    # Telegram Bot Token: 123456789:ABCdef...
+    (
+        re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"),
+        "[REDACTED_TG_TOKEN]",
+    ),
+    # FunPay golden_key (hex-подобная строка длиной 32-128)
+    (
+        re.compile(r"(?<=['\"\s=:])([a-f0-9]{32,128})(?=['\"\s,;])"),
+        "[REDACTED_KEY]",
+    ),
+]
+
+
+def _redact(text: str) -> str:
+    """Удаляет секреты из строки перед логированием."""
+    if not text:
+        return text
+    result = text
+    for pattern, repl in _SENSITIVE_PATTERNS:
+        result = pattern.sub(repl, result)
+    return result
+
+
+def _patch_record(record: dict[str, Any]) -> None:
+    """loguru patcher — вызывается для каждой записи до записи в sink."""
+    record["message"] = _redact(str(record.get("message", "")))
+    extra = record.get("extra") or {}
+    for key, val in list(extra.items()):
+        if isinstance(val, str):
+            extra[key] = _redact(val)
 
 
 class InterceptHandler(logging.Handler):
     """
-    Перехватчик стандартного logging → loguru.
-    Позволяет видеть логи Cardinal в нашем файле,
-    не изменяя ни одной строки кода Cardinal.
+    Перехватывает стандартный logging → loguru.
+    НЕ форсирует DEBUG: уровень берётся из basicConfig.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
-        # Определяем соответствующий уровень loguru
         try:
-            level: str | int = logger.level(record.levelname).name
+            level: Any = logger.level(record.levelname).name
         except ValueError:
             level = record.levelno
 
-        # Находим реального вызывающего (не logging internals)
         frame, depth = logging.currentframe(), 2
         while frame and frame.f_code.co_filename == logging.__file__:
             frame = frame.f_back  # type: ignore[assignment]
@@ -52,55 +103,93 @@ class InterceptHandler(logging.Handler):
         )
 
 
-def setup_logger(log_level: str = "DEBUG") -> None:
+def setup_logger(log_level: str = "INFO") -> None:
     """
-    Инициализирует loguru logger.
+    Инициализация логгера.
 
-    - Удаляет дефолтный sink (stderr).
-    - Добавляет file sink с ротацией.
-    - Перехватывает стандартный logging Cardinal.
+    Управление через env-переменные:
+      CARDINAL_MULTI_LOG_DIAGNOSE=1  — включить diagnose (только для локальной отладки)
+      CARDINAL_MULTI_LOG_BACKTRACE=1 — включить backtrace (только для локальной отладки)
 
-    :param log_level: минимальный уровень логирования (DEBUG/INFO/WARNING/ERROR).
+    По умолчанию оба ВЫКЛЮЧЕНЫ (безопасный дефолт для продакшена).
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Удаляем стандартный вывод loguru (stderr)
+    # Hardening прав на директорию логов
+    try:
+        LOG_DIR.chmod(0o700)
+    except OSError:
+        pass
+
+    # Читаем env-флаги (явно opt-in, дефолт = выключено)
+    enable_diagnose  = os.getenv("CARDINAL_MULTI_LOG_DIAGNOSE",  "0").strip() == "1"
+    enable_backtrace = os.getenv("CARDINAL_MULTI_LOG_BACKTRACE", "0").strip() == "1"
+
+    normalized_level = log_level.upper()
+
+    # Удаляем дефолтный stderr-sink
     logger.remove()
 
-    # Файловый sink — только файл, никакой консоли
+    # Применяем patcher (редактирование секретов)
+    logger.configure(patcher=_patch_record)
+
+    # ── Sink: файл ─────────────────────────────────────────────────────────
     logger.add(
         str(LOG_FILE),
-        level=log_level,
+        level=normalized_level,
         format=LOG_FORMAT,
         rotation=ROTATION,
         retention=RETENTION,
         compression=COMPRESSION,
         encoding="utf-8",
-        enqueue=True,       # thread-safe очередь
-        backtrace=True,
-        diagnose=True,
+        enqueue=True,           # thread-safe
+        backtrace=enable_backtrace,
+        diagnose=enable_diagnose,
     )
 
-    # Перехватываем стандартный logging Cardinal (FPC, TGBot, FunPayAPI, main)
-    logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
+    # ── Sink: консоль ──────────────────────────────────────────────────────
+    logger.add(
+        sys.stdout,
+        level=normalized_level,
+        format=LOG_FORMAT,
+        backtrace=enable_backtrace,
+        diagnose=enable_diagnose,
+        colorize=True,
+    )
 
-    # Подавляем слишком шумные библиотеки в нашем файле
-    for noisy_logger in ("httpx", "httpcore", "asyncio", "urllib3", "telebot"):
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+    # Hardening прав на файл логов
+    try:
+        LOG_FILE.touch(mode=0o600, exist_ok=True)
+    except OSError:
+        pass
 
-    logger.debug("Logger Cardinal_Multi инициализирован. Файл: {}", LOG_FILE)
+    # ── Перехват стандартного logging ──────────────────────────────────────
+    # Уровень = выбранный log_level, НЕ forced DEBUG
+    numeric_level = getattr(logging, normalized_level, logging.INFO)
+    logging.basicConfig(
+        handlers=[InterceptHandler()],
+        level=numeric_level,
+        force=True,
+    )
+
+    # Прижимаем шумные библиотеки до WARNING
+    _NOISY_LIBS = (
+        "httpx", "httpcore", "asyncio", "urllib3",
+        "telebot", "aiohttp.access", "aiohttp.server",
+        "aiogram", "apscheduler",
+    )
+    for lib in _NOISY_LIBS:
+        logging.getLogger(lib).setLevel(logging.WARNING)
+
+    logger.bind(name="logger").info(
+        "Logger initialized | level={} | diagnose={} | backtrace={} | file={}",
+        normalized_level,
+        enable_diagnose,
+        enable_backtrace,
+        LOG_FILE,
+    )
 
 
 def get_logger(name: str):
-    """
-    Возвращает loguru logger с привязанным именем модуля.
-
-    :param name: имя модуля/компонента.
-    :return: loguru logger instance.
-
-    Пример::
-
-        log = get_logger("multi.account_manager")
-        log.info("Запуск аккаунта {}", account_id)
-    """
+    """Возвращает loguru-логгер с именем модуля."""
     return logger.bind(name=name)

@@ -1,0 +1,158 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Запускать каждый понедельник в 08:00 UTC (проверка новых CVE)
+    - cron: "0 8 * * 1"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # 1. Bandit — статический анализ Python на security issues
+  # ──────────────────────────────────────────────────────────────
+  bandit:
+    name: Bandit SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Bandit
+        run: pip install bandit[toml]
+
+      - name: Run Bandit
+        run: |
+          bandit -r . \
+            -x ./venv,./tests,./FunPayCardinal \
+            -ll \
+            --format json \
+            --output bandit-report.json || true
+
+      - name: Upload Bandit Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+      - name: Fail on High/Critical issues
+        run: |
+          bandit -r . \
+            -x ./venv,./tests,./FunPayCardinal \
+            -lll \
+            --format txt
+
+  # ──────────────────────────────────────────────────────────────
+  # 2. pip-audit — проверка зависимостей на CVE
+  # ──────────────────────────────────────────────────────────────
+  pip-audit:
+    name: pip-audit (CVE scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        run: |
+          pip-audit \
+            -r requirements.txt \
+            --format json \
+            --output pip-audit-report.json || true
+
+      - name: Upload pip-audit Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+
+      - name: Fail on known vulnerabilities
+        run: pip-audit -r requirements.txt
+
+  # ──────────────────────────────────────────────────────────────
+  # 3. Semgrep — advanced SAST (паттерны security)
+  # ──────────────────────────────────────────────────────────────
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep \
+            --config "p/python" \
+            --config "p/secrets" \
+            --config "p/owasp-top-ten" \
+            --config "p/command-injection" \
+            --config "p/insecure-transport" \
+            --json \
+            --output semgrep-report.json \
+            --exclude "venv" \
+            --exclude "FunPayCardinal" \
+            . || true
+
+      - name: Upload Semgrep Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+
+  # ──────────────────────────────────────────────────────────────
+  # 4. Trufflehog — поиск секретов в истории git
+  # ──────────────────────────────────────────────────────────────
+  trufflehog:
+    name: TruffleHog (secrets scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Нужна полная история для поиска секретов
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # ──────────────────────────────────────────────────────────────
+  # 5. Check .env не попал в коммит
+  # ──────────────────────────────────────────────────────────────
+  check-secrets-not-committed:
+    name: Check no .env committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for .env files
+        run: |
+          if find . -name ".env" -not -path "./.git/*" | grep -q .; then
+            echo "❌ ОШИБКА: .env файл найден в репозитории!"
+            find . -name ".env" -not -path "./.git/*"
+            exit 1
+          fi
+          echo "✅ .env файлы не найдены в репозитории"
+
+      - name: Check for secret.key
+        run: |
+          if find . -name "secret.key" -not -path "./.git/*" | grep -q .; then
+            echo "❌ ОШИБКА: secret.key найден в репозитории!"
+            exit 1
+          fi
+          echo "✅ secret.key не найден в репозитории"
