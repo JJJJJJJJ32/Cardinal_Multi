@@ -1,209 +1,175 @@
 """
-modules/core/notifier.py
-Безопасный Telegram-нотификатор.
+TelegramNotifier — безопасная отправка уведомлений в Telegram.
 
-ИЗМЕНЕНИЯ (security fix):
-  - НЕ логируем полное тело ответа API
-  - логируем только: status + description из JSON
-  - retry + exponential backoff на 429
-  - таймаут total=10s + connect=5s
-  - graceful close сессии
+Фиксы:
+  B-13   — anti-spam (cooldown per alert type)
+  TC-052 — retry при 429 Too Many Requests
+  TC-088 — повторная проверка < ALERT_COOLDOWN
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import math
-from typing import Optional
+import time
+from typing import Any, Dict, Optional
 
 import aiohttp
 from loguru import logger
 
-_log = logger.bind(name="notifier")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Константы
+# ═══════════════════════════════════════════════════════════════════════════════
+TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
-# Максимальное время ожидания при 429 (секунды)
-_MAX_RETRY_AFTER = 60.0
-# Базовый backoff при отсутствии retry_after в ответе
-_BASE_BACKOFF    = 2.0
+MAX_RETRIES = 3
+BASE_RETRY_DELAY = 1.0      # секунды (начальная задержка)
+MAX_RETRY_AFTER = 60         # не ждать дольше 60 сек
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
+
+# Anti-spam
+DEFAULT_COOLDOWN_SECONDS = 3600  # 1 час
 
 
 class TelegramNotifier:
     """
-    Асинхронный нотификатор для Telegram Bot API.
-
-    Особенности безопасности:
-      - тело ответа НЕ логируется целиком
-      - только status + краткое description из JSON
-      - retry с backoff на 429
+    Отправка сообщений в Telegram с:
+      - retry/backoff при 429
+      - anti-spam cooldown per (chat_id, alert_key)
+      - отсутствие логирования body (секреты)
     """
 
     def __init__(
         self,
-        bot_token: str,
-        default_chat_id: str | int,
+        token: str,
+        chat_id: str | int,
+        *,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     ) -> None:
-        # Валидация: токен не должен быть пустым
-        if not bot_token or not str(bot_token).strip():
-            raise ValueError("bot_token не может быть пустым")
-        if not default_chat_id:
-            raise ValueError("default_chat_id не может быть пустым")
+        self._token = token
+        self._chat_id = str(chat_id)
+        self._cooldown_seconds = cooldown_seconds
 
-        self._bot_token      = bot_token
-        self._default_chat_id = str(default_chat_id)
-        self._session: Optional[aiohttp.ClientSession] = None
+        # ── FIX B-13: anti-spam кэш ─────────────────────────────────────────
+        # Ключ: (chat_id, alert_key) → время последней отправки (timestamp)
+        self._sent_cache: Dict[str, float] = {}
 
-    # ─── Управление сессией ─────────────────────────────────────────────────
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=10.0, connect=5.0)
-            self._session = aiohttp.ClientSession(timeout=timeout)
-        return self._session
-
-    async def close(self) -> None:
-        """Закрыть aiohttp-сессию при завершении работы бота."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            _log.debug("aiohttp session closed.")
-
-    # ─── Вспомогательный метод: безопасный парсинг ошибки ──────────────────
-
-    @staticmethod
-    def _parse_error_response(raw: str) -> tuple[Optional[str], Optional[float]]:
-        """
-        Возвращает (description, retry_after) из тела ответа.
-        Если не удалось — (None, None).
-        Намеренно не перебрасывает исключения.
-        """
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return None, None
-
-        description = data.get("description")
-        retry_after: Optional[float] = None
-        params = data.get("parameters")
-        if isinstance(params, dict):
-            ra = params.get("retry_after")
-            if ra is not None:
-                try:
-                    retry_after = float(ra)
-                except (TypeError, ValueError):
-                    pass
-        return description, retry_after
-
-    # ─── Публичный API ──────────────────────────────────────────────────────
-
-    async def send_message(
+    # ─────────────────────────────────────────────────────────────────────────
+    # Публичный метод
+    # ─────────────────────────────────────────────────────────────────────────
+    async def send(
         self,
         text: str,
-        chat_id: str | int | None = None,
-        parse_mode: Optional[str] = "HTML",
-        disable_web_page_preview: bool = True,
-        max_retries: int = 3,
+        *,
+        chat_id: Optional[str | int] = None,
+        alert_key: Optional[str] = None,
+        parse_mode: str = "HTML",
+        disable_preview: bool = True,
     ) -> bool:
         """
-        Отправить сообщение в Telegram.
+        Отправить сообщение.
 
-        :param text: текст сообщения
-        :param chat_id: переопределить chat_id (иначе default_chat_id)
-        :param parse_mode: "HTML", "Markdown" или None
-        :param disable_web_page_preview: отключить превью ссылок
-        :param max_retries: кол-во повторов при 429
-        :return: True если успешно
+        alert_key — если задан, применяется cooldown.
+                    Повторная отправка с тем же ключом блокируется
+                    на cooldown_seconds (FIX B-13).
+
+        Возвращает True при успехе, False при отказе.
         """
-        cid = str(chat_id) if chat_id is not None else self._default_chat_id
-        url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
+        target_chat = str(chat_id) if chat_id else self._chat_id
 
-        payload: dict = {
-            "chat_id": cid,
-            "text": text,
-            "disable_web_page_preview": disable_web_page_preview,
+        # ── Anti-spam check (FIX B-13 / TC-088) ─────────────────────────────
+        if alert_key is not None:
+            cache_key = f"{target_chat}:{alert_key}"
+            last_sent = self._sent_cache.get(cache_key, 0)
+            elapsed = time.monotonic() - last_sent
+
+            if elapsed < self._cooldown_seconds:
+                remaining = self._cooldown_seconds - elapsed
+                logger.debug(
+                    f"Notifier: пропуск alert_key='{alert_key}' — "
+                    f"cooldown ещё {remaining:.0f} сек"
+                )
+                return False
+
+        # ── Отправка с retry (TC-052) ────────────────────────────────────────
+        url = TELEGRAM_API.format(token=self._token)
+        payload = {
+            "chat_id": target_chat,
+            "text": text[:4096],  # Telegram лимит
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": disable_preview,
         }
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
 
-        session = await self._get_session()
-
-        for attempt in range(max_retries + 1):
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                async with session.post(url, json=payload) as resp:
+                async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            # Успех — обновляем кэш
+                            if alert_key is not None:
+                                cache_key = f"{target_chat}:{alert_key}"
+                                self._sent_cache[cache_key] = time.monotonic()
 
-                    if resp.status == 200:
-                        _log.debug("Message sent to chat_id={}.", cid)
-                        return True
+                            logger.debug(
+                                f"Notifier: сообщение отправлено в chat_id={target_chat}"
+                            )
+                            return True
 
-                    # ── Читаем body ТОЛЬКО для парсинга ошибки, не для лога ──
-                    raw = await resp.text()
-                    description, retry_after = self._parse_error_response(raw)
+                        if resp.status == 429:
+                            # TC-052: Too Many Requests
+                            data = await resp.json()
+                            retry_after = data.get("parameters", {}).get(
+                                "retry_after", BASE_RETRY_DELAY * attempt
+                            )
+                            retry_after = min(retry_after, MAX_RETRY_AFTER)
 
-                    # ── Логируем ТОЛЬКО status + description (не body!) ──────
-                    _log.error(
-                        "sendMessage failed: status={} description={}",
-                        resp.status,
-                        description or "N/A",
-                    )
+                            logger.warning(
+                                f"Notifier: 429 Too Many Requests, "
+                                f"retry через {retry_after} сек "
+                                f"(попытка {attempt}/{MAX_RETRIES})"
+                            )
+                            await asyncio.sleep(retry_after)
+                            continue
 
-                    # ── 429 Too Many Requests: ждём retry_after ──────────────
-                    if resp.status == 429 and attempt < max_retries:
-                        wait = min(
-                            retry_after if retry_after else _BASE_BACKOFF * (2 ** attempt),
-                            _MAX_RETRY_AFTER,
+                        # Другие ошибки
+                        logger.warning(
+                            f"Notifier: Telegram вернул {resp.status} "
+                            f"(попытка {attempt}/{MAX_RETRIES})"
                         )
-                        _log.warning(
-                            "Rate limited (429). Retry {}/{} after {:.1f}s.",
-                            attempt + 1,
-                            max_retries,
-                            wait,
-                        )
-                        await asyncio.sleep(wait)
-                        continue
-
-                    # ── 4xx (кроме 429): не ретраим ─────────────────────────
-                    if 400 <= resp.status < 500:
-                        return False
-
-                    # ── 5xx: ретраим с backoff ───────────────────────────────
-                    if resp.status >= 500 and attempt < max_retries:
-                        wait = _BASE_BACKOFF * (2 ** attempt)
-                        _log.warning("Server error {}. Retry in {:.1f}s.", resp.status, wait)
-                        await asyncio.sleep(wait)
-                        continue
-
-                    return False
 
             except asyncio.TimeoutError:
-                _log.error("sendMessage timeout (attempt {}/{}).", attempt + 1, max_retries + 1)
-                if attempt < max_retries:
-                    await asyncio.sleep(_BASE_BACKOFF * (2 ** attempt))
-                    continue
-                return False
-
+                logger.warning(
+                    f"Notifier: таймаут при отправке "
+                    f"(попытка {attempt}/{MAX_RETRIES})"
+                )
             except aiohttp.ClientError as exc:
-                _log.error("sendMessage network error: {}.", type(exc).__name__)
-                if attempt < max_retries:
-                    await asyncio.sleep(_BASE_BACKOFF * (2 ** attempt))
-                    continue
-                return False
+                logger.warning(
+                    f"Notifier: ошибка сети — {exc!r} "
+                    f"(попытка {attempt}/{MAX_RETRIES})"
+                )
 
-            except Exception as exc:
-                _log.error("sendMessage unexpected error: {}.", type(exc).__name__)
-                return False
+            # Экспоненциальный backoff
+            if attempt < MAX_RETRIES:
+                delay = BASE_RETRY_DELAY * (2 ** (attempt - 1))
+                await asyncio.sleep(delay)
 
+        logger.error(
+            f"Notifier: не удалось отправить сообщение после {MAX_RETRIES} попыток"
+        )
         return False
 
-    async def send_safe(
-        self,
-        text: str,
-        chat_id: str | int | None = None,
-    ) -> bool:
+    # ─────────────────────────────────────────────────────────────────────────
+    # Утилиты
+    # ─────────────────────────────────────────────────────────────────────────
+    def reset_cooldown(self, alert_key: str, chat_id: Optional[str | int] = None) -> None:
         """
-        Алиас: отправка без HTML (plain text).
-        Используй когда text содержит пользовательский ввод.
+        Сбросить cooldown для alert_key (TC-089: баланс выше порога → сброс).
         """
-        return await self.send_message(
-            text=text,
-            chat_id=chat_id,
-            parse_mode=None,
-        )
+        target_chat = str(chat_id) if chat_id else self._chat_id
+        cache_key = f"{target_chat}:{alert_key}"
+        if cache_key in self._sent_cache:
+            del self._sent_cache[cache_key]
+            logger.debug(f"Notifier: cooldown сброшен для '{alert_key}'")
+
+    def clear_cache(self) -> None:
+        """Очистить весь anti-spam кэш."""
+        self._sent_cache.clear()

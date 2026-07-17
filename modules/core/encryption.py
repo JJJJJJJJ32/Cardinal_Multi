@@ -1,164 +1,124 @@
 """
-modules/core/encryption.py
-──────────────────────────
-Симметричное шифрование данных через Fernet (AES-128-CBC + HMAC-SHA256).
-Все секреты (golden_key, токены Telegram) хранятся в БД в зашифрованном виде.
+Encryption — Fernet шифрование секретов.
 
-Ключ: ./data/secret.key
-- Если файл существует — читается оттуда.
-- Если нет — генерируется новый и сохраняется.
+Фиксы:
+  TC-006 — создание ключа при первом запуске
+  TC-007 — загрузка существующего ключа
+  TC-091 — удаление ключа в runtime
+  TC-092 — замена ключа → InvalidToken при расшифровке
+  TC-093 — битый шифртекст
 """
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
+from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
 
-
-# ─── Константы ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Константы
+# ═══════════════════════════════════════════════════════════════════════════════
 DATA_DIR = Path("data")
 KEY_FILE = DATA_DIR / "secret.key"
 
 
 class EncryptionError(Exception):
-    """Ошибка шифрования/дешифровки."""
+    """Ошибка шифрования/дешифрования."""
     pass
 
 
 class Encryption:
     """
-    Менеджер Fernet-шифрования.
+    Singleton для Fernet-шифрования.
 
-    Синглтон: один экземпляр на весь процесс.
-    Ключ загружается/генерируется при первом обращении.
-
-    Пример использования::
-
-        enc = Encryption()
-        encrypted = enc.encrypt("my_golden_key_value")
-        original  = enc.decrypt(encrypted)
+    Гарантии:
+      - ключ создаётся автоматически если не существует
+      - ключ хранится в data/secret.key с правами 600
+      - decrypt при невалидном ключе/шифртексте → EncryptionError (не crash)
     """
 
-    _instance: "Encryption | None" = None
-    _fernet: Fernet | None = None
+    _instance: Optional["Encryption"] = None
+    _fernet: Optional[Fernet] = None
 
     def __new__(cls) -> "Encryption":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._initialize()
+            cls._instance._init_key()
         return cls._instance
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Инициализация
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _initialize(self) -> None:
-        """Загружает или создаёт ключ шифрования."""
+    def _init_key(self) -> None:
+        """Загрузить или создать ключ шифрования."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         if KEY_FILE.exists():
-            key = self._load_key()
-            logger.debug("Ключ шифрования загружен из {}", KEY_FILE)
+            # TC-007: загрузка существующего ключа
+            try:
+                key = KEY_FILE.read_bytes().strip()
+                self._fernet = Fernet(key)
+                logger.debug("Encryption: ключ загружен из secret.key")
+            except Exception as exc:
+                logger.error(f"Encryption: не удалось загрузить ключ — {exc}")
+                raise EncryptionError(
+                    f"Невалидный ключ в {KEY_FILE}. "
+                    f"Удалите файл для генерации нового (данные будут потеряны)."
+                ) from exc
         else:
-            key = self._generate_key()
-            logger.info("Новый ключ шифрования создан: {}", KEY_FILE)
-
-        self._fernet = Fernet(key)
-
-    def _generate_key(self) -> bytes:
-        """
-        Генерирует новый Fernet-ключ и сохраняет в файл.
-
-        :return: bytes ключ.
-        :raises EncryptionError: если не удалось записать файл.
-        """
-        key = Fernet.generate_key()
-        try:
+            # TC-006: создание нового ключа
+            key = Fernet.generate_key()
             KEY_FILE.write_bytes(key)
-            # Ограничиваем права на файл (только чтение/запись владельца)
-            KEY_FILE.chmod(0o600)
-        except OSError as exc:
-            raise EncryptionError(
-                f"Не удалось сохранить ключ шифрования в {KEY_FILE}: {exc}"
-            ) from exc
-        return key
 
-    def _load_key(self) -> bytes:
+            # Права 600 (owner only) — Linux/Mac
+            if os.name != "nt":
+                try:
+                    KEY_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+                except OSError:
+                    pass
+
+            self._fernet = Fernet(key)
+            logger.info("Encryption: новый ключ создан и сохранён")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Публичные методы
+    # ─────────────────────────────────────────────────────────────────────────
+    def encrypt(self, plaintext: str) -> str:
         """
-        Загружает ключ из файла.
+        Зашифровать строку → base64 Fernet token.
 
-        :return: bytes ключ.
-        :raises EncryptionError: если файл повреждён или недоступен.
-        """
-        try:
-            key = KEY_FILE.read_bytes().strip()
-            if not key:
-                raise EncryptionError(f"Файл ключа {KEY_FILE} пуст.")
-            return key
-        except OSError as exc:
-            raise EncryptionError(
-                f"Не удалось прочитать ключ шифрования из {KEY_FILE}: {exc}"
-            ) from exc
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Публичный API
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def encrypt(self, text: str) -> str:
-        """
-        Шифрует строку и возвращает base64-encoded шифротекст.
-
-        :param text: открытый текст для шифрования.
-        :return: зашифрованная строка (base64).
-        :raises EncryptionError: при ошибке шифрования.
-
-        Пример::
-
-            token_encrypted = Encryption().encrypt("1234567890:ABCdef...")
+        TC-091: если ключ был удалён после init — используем ключ из памяти.
         """
         if self._fernet is None:
-            raise EncryptionError("Fernet не инициализирован.")
+            raise EncryptionError("Encryption не инициализирован (ключ отсутствует)")
+
         try:
-            return self._fernet.encrypt(text.encode("utf-8")).decode("utf-8")
+            return self._fernet.encrypt(plaintext.encode("utf-8")).decode("utf-8")
         except Exception as exc:
             raise EncryptionError(f"Ошибка шифрования: {exc}") from exc
 
-    def decrypt(self, token: str) -> str:
+    def decrypt(self, ciphertext: str) -> str:
         """
-        Дешифрует base64-encoded шифротекст.
+        Расшифровать Fernet token → исходная строка.
 
-        :param token: зашифрованная строка (base64).
-        :return: открытый текст.
-        :raises EncryptionError: при ошибке дешифровки (неверный ключ / повреждённые данные).
-
-        Пример::
-
-            golden_key = Encryption().decrypt(encrypted_golden_key)
+        TC-092: InvalidToken если ключ подменён.
+        TC-093: InvalidToken если шифртекст битый.
         """
         if self._fernet is None:
-            raise EncryptionError("Fernet не инициализирован.")
+            raise EncryptionError("Encryption не инициализирован (ключ отсутствует)")
+
         try:
-            return self._fernet.decrypt(token.encode("utf-8")).decode("utf-8")
-        except InvalidToken as exc:
+            return self._fernet.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+        except InvalidToken:
             raise EncryptionError(
-                "Не удалось расшифровать данные. "
-                "Возможно, ключ шифрования был изменён или данные повреждены."
-            ) from exc
+                "Не удалось расшифровать данные: ключ не совпадает или данные повреждены. "
+                "Возможно, файл secret.key был заменён."
+            )
         except Exception as exc:
-            raise EncryptionError(f"Ошибка дешифровки: {exc}") from exc
+            raise EncryptionError(f"Ошибка дешифрования: {exc}") from exc
 
-    def rotate_key(self) -> None:
-        """
-        Генерирует новый ключ. Вызывать ТОЛЬКО если старый скомпрометирован.
-        После вызова все зашифрованные данные в БД станут нечитаемы.
-
-        .. warning::
-            Метод не перешифровывает данные в БД автоматически.
-        """
-        logger.warning(
-            "Ротация ключа шифрования! Все зашифрованные данные необходимо перезаписать."
-        )
-        key = self._generate_key()
-        self._fernet = Fernet(key)
+    @staticmethod
+    def is_initialized() -> bool:
+        """Проверить, инициализирован ли Encryption."""
+        return Encryption._instance is not None and Encryption._fernet is not None

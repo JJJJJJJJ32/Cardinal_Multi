@@ -1,116 +1,156 @@
 """
-modules/cardinal_bridge/hooks.py — patch: generate_plugin_file
+Cardinal Bridge — генерация bridge-плагина для FunPayCardinal.
 
-ИЗМЕНЕНИЯ (security fix):
-  - строгая валидация account_id: int() + диапазон [1..9999]
-  - атомарная запись (tempfile → os.replace)
-  - только числовая интерполяция в template (не строки)
-  - chmod 0644 на сгенерированный файл
+Фиксы:
+  TC-046 — валидный account_id
+  TC-047 — account_id строка "abc"
+  TC-048 — account_id=0, 10000
+  TC-129 — регенерация при смене primary
 """
 
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from loguru import logger
 
-_log = logger.bind(name="cardinal_bridge")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Константы
+# ═══════════════════════════════════════════════════════════════════════════════
+PLUGINS_DIR = Path("plugins")
+BRIDGE_PLUGIN_NAME = "cardinal_multi_bridge.py"
+BRIDGE_PLUGIN_PATH = PLUGINS_DIR / BRIDGE_PLUGIN_NAME
 
-PLUGIN_FILE = Path("plugins") / "cardinal_multi_bridge.py"
+MIN_ACCOUNT_ID = 1
+MAX_ACCOUNT_ID = 9999
 
-_MIN_ACCOUNT_ID = 1
-_MAX_ACCOUNT_ID = 9_999
+# Шаблон bridge-плагина
+_BRIDGE_TEMPLATE = '''"""
+Cardinal Multi Bridge Plugin (автогенерация).
+
+Этот файл генерируется автоматически при запуске Cardinal_Multi.
+НЕ РЕДАКТИРУЙТЕ ВРУЧНУЮ — изменения будут перезаписаны.
+
+Account ID: {account_id}
+"""
+
+from __future__ import annotations
+
+ACCOUNT_ID: int = {account_id}
 
 
-def generate_plugin_file(account_id: Union[int, str] = 1) -> None:
+def get_account_id() -> int:
+    """Вернуть ID аккаунта, для которого генерирован плагин."""
+    return ACCOUNT_ID
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Валидация
+# ═══════════════════════════════════════════════════════════════════════════════
+def _validate_account_id(account_id: Union[int, str, None]) -> int:
     """
-    Создаёт файл плагина plugins/cardinal_multi_bridge.py.
+    Валидация и приведение account_id к int.
 
-    :param account_id: ID аккаунта (int, 1..9999)
-    :raises ValueError: если account_id невалиден
-    :raises OSError: если не удалось записать файл
+    TC-047: "abc" → ValueError
+    TC-048: 0 / 10000 → ValueError
     """
-    # ── Жёсткая валидация ────────────────────────────────────────────────────
+    if account_id is None:
+        raise ValueError("account_id не может быть None")
+
     try:
-        account_id_int = int(account_id)
-    except (TypeError, ValueError) as exc:
+        aid = int(account_id)
+    except (ValueError, TypeError):
         raise ValueError(
-            f"account_id должен быть числом, получено: {type(account_id).__name__!r}"
-        ) from exc
-
-    if not (_MIN_ACCOUNT_ID <= account_id_int <= _MAX_ACCOUNT_ID):
-        raise ValueError(
-            f"account_id вне допустимого диапазона "
-            f"[{_MIN_ACCOUNT_ID}..{_MAX_ACCOUNT_ID}], получено: {account_id_int}"
+            f"account_id должен быть целым числом, получено: {account_id!r}"
         )
 
-    # ── Создаём директорию плагинов ──────────────────────────────────────────
-    PLUGIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not (MIN_ACCOUNT_ID <= aid <= MAX_ACCOUNT_ID):
+        raise ValueError(
+            f"account_id должен быть в диапазоне "
+            f"{MIN_ACCOUNT_ID}..{MAX_ACCOUNT_ID}, получено: {aid}"
+        )
 
-    # ── Шаблон: только числовая интерполяция ─────────────────────────────────
-    # Нет строковых вставок из внешнего источника → нет injection
-    content = (
-        '"""Cardinal_Multi Bridge Plugin\n'
-        "\n"
-        "Сгенерировано автоматически Cardinal_Multi.\n"
-        'НЕ РЕДАКТИРУЙТЕ ВРУЧНУЮ — файл перезаписывается при запуске.\n'
-        '"""\n'
-        "\n"
-        f"MULTI_ACCOUNT_ID: int = {account_id_int}\n"
-        "\n"
-        "\n"
-        "def init_cardinal_multi(cardinal) -> None:\n"
-        '    """Инициализация моста Cardinal_Multi."""\n'
-        "    try:\n"
-        "        from modules.cardinal_bridge.hooks import install_hooks\n"
-        "        install_hooks(cardinal, MULTI_ACCOUNT_ID)\n"
-        "    except Exception as exc:\n"
-        "        import logging\n"
-        '        logging.getLogger("FPC").error(\n'
-        '            "[Cardinal_Multi] Не удалось установить хуки: %s", exc\n'
-        "        )\n"
-        "\n"
-        "\n"
-        "BIND_TO_PRE_INIT = [init_cardinal_multi]\n"
-    )
+    return aid
 
-    # ── Атомарная запись ──────────────────────────────────────────────────────
-    tmp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            delete=False,
-            dir=str(PLUGIN_FILE.parent),
-            prefix=".tmp_bridge_",
-            suffix=".py",
-        ) as tf:
-            tmp_path = tf.name
-            tf.write(content)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Генерация файла
+# ═══════════════════════════════════════════════════════════════════════════════
+def generate_plugin_file(
+    account_id: Union[int, str, None] = 1,
+    *,
+    force: bool = False,
+) -> Path:
+    """
+    Генерирует (или регенерирует) bridge-плагин.
+
+    Атомарная запись: пишем во временный файл → os.replace().
+
+    TC-129: если force=False и файл уже содержит правильный account_id —
+    пропускаем генерацию.
+
+    Returns:
+        Path к сгенерированному файлу.
+
+    Raises:
+        ValueError: если account_id невалиден.
+        OSError: если нет прав на запись в plugins/.
+    """
+    aid = _validate_account_id(account_id)
+
+    # ── Создаём plugins/ если нет ────────────────────────────────────────────
+    PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── TC-129: проверяем — может файл уже актуален? ─────────────────────────
+    if not force and BRIDGE_PLUGIN_PATH.exists():
         try:
-            os.chmod(tmp_path, 0o644)
+            content = BRIDGE_PLUGIN_PATH.read_text(encoding="utf-8")
+            if f"ACCOUNT_ID: int = {aid}" in content:
+                logger.debug(
+                    f"Bridge plugin уже содержит account_id={aid}, пропуск"
+                )
+                return BRIDGE_PLUGIN_PATH
         except OSError:
-            pass
+            pass  # Не можем прочитать — перегенерим
 
-        os.replace(tmp_path, str(PLUGIN_FILE))
-        tmp_path = None
+    # ── Генерация через атомарную запись ──────────────────────────────────────
+    plugin_content = _BRIDGE_TEMPLATE.format(account_id=aid)
 
-        _log.info(
-            "Bridge plugin создан: {} (account_id={})",
-            PLUGIN_FILE,
-            account_id_int,
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(PLUGINS_DIR),
+            prefix=".bridge_tmp_",
+            suffix=".py",
         )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(plugin_content)
+                f.flush()
+                os.fsync(f.fileno())
 
-    except OSError as exc:
-        _log.error("Не удалось записать bridge plugin: {}", exc)
-        raise
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
+            # Устанавливаем права (owner: rw, group/other: r)
+            if os.name != "nt":
+                os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+
+            # Атомарная замена
+            os.replace(tmp_path, str(BRIDGE_PLUGIN_PATH))
+
+        except Exception:
+            # Чистим временный файл если что-то пошло не так
             try:
-                os.remove(tmp_path)
+                os.unlink(tmp_path)
             except OSError:
                 pass
+            raise
+
+    except OSError as exc:
+        logger.error(f"Bridge plugin: не удалось создать файл — {exc}")
+        raise
+
+    logger.info(f"Bridge plugin сгенерирован: {BRIDGE_PLUGIN_PATH} (account_id={aid})")
+    return BRIDGE_PLUGIN_PATH

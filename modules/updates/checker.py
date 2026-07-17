@@ -1,189 +1,187 @@
 """
-modules/updates/checker.py
-Проверка обновлений Cardinal_Multi через GitHub Releases API.
-Запускается 1 раз при старте + раз в сутки через APScheduler.
+UpdateChecker — проверка новых версий Cardinal_Multi через GitHub Releases API.
+
+Фиксы:
+  B-01  — graceful fallback если packaging не установлен
+  B-18  — кэш последней нотифицированной версии (не спамить)
+  TC-079 — InvalidVersion при кривом tag
+  TC-080 — пустой список releases
+  TC-082 — GitHub 403/rate-limit
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
 from loguru import logger
-from packaging.version import Version, InvalidVersion
-from sqlalchemy import select
 
-from modules.core.database import get_session
-from modules.core.notifier import get_notifier
-from modules.updates.models.update_check import UpdateCheck
+# ─── FIX B-01: graceful import packaging ────────────────────────────────────
+try:
+    from packaging.version import Version, InvalidVersion
+except ImportError:
+    logger.warning(
+        "Пакет 'packaging' не установлен — UpdateChecker будет сравнивать "
+        "версии как строки. Установите: pip install packaging>=24.0"
+    )
+    Version = None         # type: ignore[assignment, misc]
+    InvalidVersion = None  # type: ignore[assignment, misc]
 
 
-# ──────────────────────────────────────────────
-# НАСТРОЙКИ (менять под реальный репо)
-# ──────────────────────────────────────────────
-GITHUB_OWNER = "JJJJJJJJ32"
-GITHUB_REPO = "Cardinal_Multi"
-CURRENT_VERSION = "1.0.0"          # TODO: брать из конфига/VERSION файла
-CHECK_INTERVAL_HOURS = 24
-# ──────────────────────────────────────────────
+# ─── Константы ──────────────────────────────────────────────────────────────
+GITHUB_API_URL = (
+    "https://api.github.com/repos/{owner}/{repo}/releases/latest"
+)
+DEFAULT_OWNER = "JJJJJJJJ32"
+DEFAULT_REPO = "Cardinal_Multi"
+
+CURRENT_VERSION = "1.0.0"   # ← обновлять при релизе (или читать из __version__)
+
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
 class UpdateChecker:
-    """
-    Проверяет наличие новых версий Cardinal_Multi на GitHub.
-    Уведомляет владельца в Telegram.
-    НЕ скачивает и НЕ устанавливает автоматически.
-    """
+    """Проверяет GitHub Releases и уведомляет о новой версии."""
 
-    API_URL = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-    )
+    def __init__(
+        self,
+        *,
+        owner: str = DEFAULT_OWNER,
+        repo: str = DEFAULT_REPO,
+        current_version: str = CURRENT_VERSION,
+        notifier=None,          # TelegramNotifier (опционально)
+    ) -> None:
+        self._owner = owner
+        self._repo = repo
+        self._current_version = current_version
+        self._notifier = notifier
 
-    def __init__(self) -> None:
-        self._log = logger.bind(module="UpdateChecker")
-        self._notifier = get_notifier()
+        # ── FIX B-18: кэш последней отправленной версии ─────────────────────
+        self._last_notified_tag: Optional[str] = None
 
-    async def check(self, force: bool = False) -> Optional[str]:
-        """
-        Проверить наличие обновления.
-
-        Args:
-            force: Игнорировать кэш и проверить принудительно.
-
-        Returns:
-            Версия новой версии если есть, иначе None.
-        """
-        # Проверить кэш в БД
-        if not force:
-            cached = await self._get_cached()
-            if cached and cached.last_checked_at:
-                hours_since = (datetime.utcnow() - cached.last_checked_at).total_seconds() / 3600
-                if hours_since < CHECK_INTERVAL_HOURS:
-                    self._log.debug(
-                        f"Проверка обновлений: кэш актуален "
-                        f"({hours_since:.1f}ч < {CHECK_INTERVAL_HOURS}ч)."
-                    )
-                    return None
-
-        self._log.info("Проверка обновлений на GitHub...")
-
+    # ─────────────────────────────────────────────────────────────────────────
+    # Публичный метод (вызывается из scheduler)
+    # ─────────────────────────────────────────────────────────────────────────
+    async def check(self) -> None:
+        """Проверить последний релиз на GitHub и уведомить, если есть обновление."""
         try:
-            release_data = await self._fetch_latest_release()
-        except Exception as e:
-            self._log.error(f"Ошибка запроса GitHub API: {e}")
-            return None
+            tag, html_url = await self._fetch_latest_release()
+        except Exception as exc:
+            # TC-066 / TC-082: любая ошибка сети / API — не валим процесс
+            logger.warning(f"UpdateChecker: не удалось проверить обновления — {exc}")
+            return
 
-        if not release_data:
-            return None
+        if tag is None:
+            # TC-080: пустой ответ / нет релизов
+            logger.info("UpdateChecker: релизов на GitHub не найдено")
+            return
 
-        latest_version_raw: str = release_data.get("tag_name", "").lstrip("v")
-        changelog: str = release_data.get("body", "")[:1000]
-        release_url: str = release_data.get("html_url", "")
+        # ── Сравнение версий ─────────────────────────────────────────────────
+        is_newer = self._is_newer(tag)
+        if is_newer is None:
+            # TC-079: не удалось распарсить — просто логируем
+            return
 
-        # Сохранить в кэш
-        await self._save_cache(
-            latest_version=latest_version_raw,
-            changelog=changelog,
-            release_url=release_url,
+        if not is_newer:
+            logger.info(
+                f"UpdateChecker: текущая версия {self._current_version} актуальна "
+                f"(latest: {tag})"
+            )
+            return
+
+        # ── FIX B-18: не спамить одной и той же версией ──────────────────────
+        if tag == self._last_notified_tag:
+            logger.debug(
+                f"UpdateChecker: версия {tag} уже была нотифицирована, пропуск"
+            )
+            return
+
+        self._last_notified_tag = tag
+
+        msg = (
+            f"🆕 Доступна новая версия Cardinal_Multi: {tag}\n"
+            f"Текущая: {self._current_version}\n"
+            f"Скачать: {html_url or 'https://github.com/' + self._owner + '/' + self._repo + '/releases'}"
         )
+        logger.info(msg)
 
-        # Сравнить версии
-        try:
-            is_newer = Version(latest_version_raw) > Version(CURRENT_VERSION)
-        except InvalidVersion:
-            self._log.warning(f"Не удалось разобрать версию: {latest_version_raw!r}")
-            return None
+        if self._notifier is not None:
+            try:
+                await self._notifier.send(msg)
+            except Exception as exc:
+                logger.warning(f"UpdateChecker: не удалось отправить уведомление — {exc}")
 
-        if is_newer:
-            self._log.info(
-                f"Доступна новая версия: {CURRENT_VERSION} → {latest_version_raw}"
-            )
-            await self._notify_update(
-                current=CURRENT_VERSION,
-                latest=latest_version_raw,
-                changelog=changelog,
-                release_url=release_url,
-            )
-            return latest_version_raw
-        else:
-            self._log.info(
-                f"Версия актуальна: {CURRENT_VERSION} (последняя: {latest_version_raw})"
-            )
-            return None
+    # ─────────────────────────────────────────────────────────────────────────
+    # Приватные методы
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _fetch_latest_release(self) -> tuple[Optional[str], Optional[str]]:
+        """
+        Возвращает (tag_name, html_url) или (None, None).
 
-    async def _fetch_latest_release(self) -> Optional[dict]:
+        Raises при фатальных сетевых ошибках.
+        """
+        url = GITHUB_API_URL.format(owner=self._owner, repo=self._repo)
         headers = {
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": f"CardinalMulti/{self._current_version}",
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                self.API_URL,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status == 404:
-                    self._log.warning("GitHub API: релизов не найдено.")
-                    return None
-                else:
-                    self._log.error(f"GitHub API: HTTP {resp.status}")
-                    return None
 
-    async def _notify_update(
-        self,
-        current: str,
-        latest: str,
-        changelog: str,
-        release_url: str,
-    ) -> None:
-        # Обрезаем changelog для Telegram
-        short_changelog = changelog[:500] + ("..." if len(changelog) > 500 else "")
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            async with session.get(url, headers=headers) as resp:
+                # TC-082: GitHub rate limit
+                if resp.status == 403:
+                    logger.warning(
+                        "UpdateChecker: GitHub вернул 403 (rate-limit или forbidden). "
+                        "Следующая попытка при следующем цикле."
+                    )
+                    return None, None
 
-        text = (
-            f"📦 <b>Доступна новая версия Cardinal_Multi!</b>\n"
-            f"\n"
-            f"Текущая: <code>v{current}</code>\n"
-            f"Новая: <code>v{latest}</code>\n"
-            f"\n"
-            f"Что нового:\n"
-            f"<pre>{short_changelog}</pre>\n"
-            f"\n"
-            f"🔗 <a href=\"{release_url}\">Скачать</a>"
-        )
+                if resp.status == 404:
+                    # Нет релизов вообще
+                    return None, None
 
-        await self._notifier.send(text=text)
+                resp.raise_for_status()
+                data = await resp.json()
 
-    async def _get_cached(self) -> Optional[UpdateCheck]:
-        async with get_session() as session:
-            result = await session.execute(
-                select(UpdateCheck).order_by(UpdateCheck.id.desc()).limit(1)
-            )
-            return result.scalar_one_or_none()
+        tag = data.get("tag_name")
+        html_url = data.get("html_url")
 
-    async def _save_cache(
-        self,
-        latest_version: str,
-        changelog: str,
-        release_url: str,
-    ) -> None:
-        async with get_session() as session:
-            # Один ряд — обновляем или создаём
-            result = await session.execute(
-                select(UpdateCheck).limit(1)
-            )
-            record = result.scalar_one_or_none()
+        if not tag:
+            return None, None
 
-            if record is None:
-                record = UpdateCheck()
-                session.add(record)
+        return tag, html_url
 
-            record.last_checked_at = datetime.utcnow()
-            record.latest_version = latest_version
-            record.current_version = CURRENT_VERSION
-            record.changelog = changelog
-            record.release_url = release_url
+    def _is_newer(self, tag: str) -> Optional[bool]:
+        """
+        True  — tag новее текущей версии.
+        False — tag такой же или старее.
+        None  — не удалось распарсить (TC-079).
+        """
+        # Убираем ведущую "v" ("v1.2.3" → "1.2.3")
+        clean_tag = tag.lstrip("vV")
+        clean_current = self._current_version.lstrip("vV")
 
-            await session.commit()
+        # Если packaging доступен — точное семантическое сравнение
+        if Version is not None:
+            try:
+                remote = Version(clean_tag)
+            except InvalidVersion:
+                logger.warning(
+                    f"UpdateChecker: не удалось распарсить версию из тега: '{tag}'"
+                )
+                return None
+            try:
+                local = Version(clean_current)
+            except InvalidVersion:
+                logger.error(
+                    f"UpdateChecker: не удалось распарсить ТЕКУЩУЮ версию: "
+                    f"'{self._current_version}'"
+                )
+                return None
+            return remote > local
+
+        # Fallback: простое строковое сравнение (лучше чем ничего)
+        logger.debug("UpdateChecker: packaging недоступен, строковое сравнение")
+        return clean_tag != clean_current

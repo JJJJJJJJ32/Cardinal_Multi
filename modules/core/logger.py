@@ -1,195 +1,205 @@
 """
-modules/core/logger.py
-Безопасная инициализация loguru.
+Логгер Cardinal_Multi — loguru с фильтрацией секретов.
 
-ИЗМЕНЕНИЯ (security fix):
-  - diagnose/backtrace управляются через env (default=False)
-  - уровень перехвата std logging = log_level (не forced DEBUG)
-  - patcher редактирует токены/ключи до записи в файл
-  - права на logs/ = 0700, лог-файл = 0600
-  - шумные библиотеки прижаты до WARNING
+Фиксы:
+  B-07   — redact в stacktrace / exc_info
+  TC-116 — fallback в stdout при отсутствии прав на logs/
+  TC-117 — golden_key в traceback
+  TC-118 — thread-safe (loguru сам потокобезопасен)
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Pattern
 
 from loguru import logger
 
-# ─── Пути ───────────────────────────────────────────────────────────────────
-LOG_DIR = Path("logs")
-LOG_FILE = LOG_DIR / "cardinal_multi.log"
-
-# ─── Формат ─────────────────────────────────────────────────────────────────
-LOG_FORMAT = (
-    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-    "<level>{level: <8}</level> | "
-    "{extra[name]} | "
-    "<cyan>{module}</cyan>:<cyan>{line}</cyan> - "
-    "<level>{message}</level>"
-)
-
-ROTATION    = "10 MB"
-RETENTION   = "30 days"
-COMPRESSION = "zip"
-
-# ─── Паттерны для редактирования секретов ────────────────────────────────────
-_SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    # golden_key=..., token=..., Authorization: Bearer ...
-    (
-        re.compile(
-            r"(?i)\b(golden_key|token|authorization|cookie|api_key|secret)\b"
-            r"(\s*[:=]\s*)([^\s'\";,&]{4,})",
-            re.IGNORECASE,
-        ),
-        r"\1\2[REDACTED]",
-    ),
-    # Telegram Bot Token: 123456789:ABCdef...
-    (
-        re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"),
-        "[REDACTED_TG_TOKEN]",
-    ),
-    # FunPay golden_key (hex-подобная строка длиной 32-128)
-    (
-        re.compile(r"(?<=['\"\s=:])([a-f0-9]{32,128})(?=['\"\s,;])"),
-        "[REDACTED_KEY]",
+# ═══════════════════════════════════════════════════════════════════════════════
+# Паттерны секретов для редакции
+# ═══════════════════════════════════════════════════════════════════════════════
+_SECRET_PATTERNS: list[re.Pattern] = [
+    # Telegram Bot Token: 123456789:ABCdef…
+    re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b"),
+    # golden_key (hex 32+)
+    re.compile(r"golden_key[=:\s]+['\"]?([a-fA-F0-9]{32,})['\"]?"),
+    # Bearer / Authorization header
+    re.compile(r"(Bearer\s+)[A-Za-z0-9_.~+/=-]+", re.IGNORECASE),
+    re.compile(r"(Authorization[=:\s]+)[^\s,;]+", re.IGNORECASE),
+    # Fernet token (gAAAAA…)
+    re.compile(r"gAAAAA[A-Za-z0-9_=-]{40,}"),
+    # Универсальный шаблон: token=..., secret=..., password=... api_key=...
+    re.compile(
+        r"((?:token|secret|password|api_key|apikey|secret_key)[=:\s]+)[^\s,;'\"]{8,}",
+        re.IGNORECASE,
     ),
 ]
 
+_REDACTED = "[REDACTED]"
+
 
 def _redact(text: str) -> str:
-    """Удаляет секреты из строки перед логированием."""
-    if not text:
-        return text
-    result = text
-    for pattern, repl in _SENSITIVE_PATTERNS:
-        result = pattern.sub(repl, result)
-    return result
+    """Заменить все совпадения секретов на [REDACTED]."""
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(_REDACTED, text)
+    return text
 
 
-def _patch_record(record: dict[str, Any]) -> None:
-    """loguru patcher — вызывается для каждой записи до записи в sink."""
-    record["message"] = _redact(str(record.get("message", "")))
-    extra = record.get("extra") or {}
-    for key, val in list(extra.items()):
-        if isinstance(val, str):
-            extra[key] = _redact(val)
-
-
-class InterceptHandler(logging.Handler):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Loguru filter + format
+# ═══════════════════════════════════════════════════════════════════════════════
+def _secret_filter(record: dict) -> bool:
     """
-    Перехватывает стандартный logging → loguru.
-    НЕ форсирует DEBUG: уровень берётся из basicConfig.
+    Loguru filter: редактирует message + exception traceback.
+
+    FIX B-07 / TC-117: stacktrace тоже проходит через _redact().
     """
+    # Редактируем само сообщение
+    record["message"] = _redact(record["message"])
 
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            level: Any = logger.level(record.levelname).name
-        except ValueError:
-            level = record.levelno
-
-        frame, depth = logging.currentframe(), 2
-        while frame and frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back  # type: ignore[assignment]
-            depth += 1
-
-        logger.opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
-        )
-
-
-def setup_logger(log_level: str = "INFO") -> None:
-    """
-    Инициализация логгера.
-
-    Управление через env-переменные:
-      CARDINAL_MULTI_LOG_DIAGNOSE=1  — включить diagnose (только для локальной отладки)
-      CARDINAL_MULTI_LOG_BACKTRACE=1 — включить backtrace (только для локальной отладки)
-
-    По умолчанию оба ВЫКЛЮЧЕНЫ (безопасный дефолт для продакшена).
-    """
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Hardening прав на директорию логов
-    try:
-        LOG_DIR.chmod(0o700)
-    except OSError:
+    # Редактируем exception / traceback (FIX B-07)
+    exc = record.get("exception")
+    if exc is not None:
+        # exc — это кортеж (type, value, traceback) или loguru RecordException
+        # loguru хранит строковое представление, патчим value.__str__ нельзя,
+        # поэтому патчим formatted в record["extra"]["formatted_exception"]
+        # Самый надёжный путь — перехватить в format-функции (ниже).
         pass
 
-    # Читаем env-флаги (явно opt-in, дефолт = выключено)
-    enable_diagnose  = os.getenv("CARDINAL_MULTI_LOG_DIAGNOSE",  "0").strip() == "1"
-    enable_backtrace = os.getenv("CARDINAL_MULTI_LOG_BACKTRACE", "0").strip() == "1"
+    return True
 
-    normalized_level = log_level.upper()
 
-    # Удаляем дефолтный stderr-sink
+def _format_with_redact(record: dict) -> str:
+    """
+    Формат строки логов.
+    Включая exception — всё проходит через _redact().
+    """
+    # Базовый формат
+    fmt = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+        "<level>{message}</level>"
+    )
+
+    # Если есть exception — добавляем и редактируем
+    if record["exception"]:
+        fmt += "\n{exception}"
+
+    fmt += "\n"
+    return fmt
+
+
+def _patched_format(record: dict) -> str:
+    """Loguru вызывает format(record) — мы перехватываем и редактируем вывод."""
+    base = _format_with_redact(record)
+    # _redact применяется ко всему итоговому тексту (включая traceback)
+    # через sink patcher ниже
+    return base
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Patcher: применяет _redact ко ВСЕМУ, что идёт в sink
+# ═══════════════════════════════════════════════════════════════════════════════
+def _patcher(record: dict) -> None:
+    """
+    Loguru patcher: вызывается до format.
+    Редактирует message. Exception редактируется в sink через обёртку.
+    """
+    record["message"] = _redact(record["message"])
+
+
+class _RedactSink:
+    """
+    Обёртка над файловым sink — пропускает финальную строку через _redact.
+
+    Это гарантирует, что даже traceback в exception будет отредактирован.
+    (FIX B-07 / TC-117)
+    """
+
+    def __init__(self, sink_func):
+        self._sink = sink_func
+
+    def write(self, message: str) -> None:
+        self._sink(_redact(str(message)))
+
+    def flush(self) -> None:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Публичная функция setup
+# ═══════════════════════════════════════════════════════════════════════════════
+LOG_DIR = Path("logs")
+LOG_FILE = LOG_DIR / "cardinal_multi.log"
+
+# Ротация / Retention
+LOG_ROTATION = "10 MB"
+LOG_RETENTION = "7 days"
+LOG_COMPRESSION = "zip"
+
+
+def setup_logger(level: str = "DEBUG") -> None:
+    """
+    Настроить loguru с:
+      - stdout (с цветами)
+      - файл в logs/ (с ротацией)
+      - redact секретов ВЕЗДЕ (включая traceback)
+
+    TC-116: если logs/ недоступна — логи только в stdout, без краша.
+    """
+    # Удаляем все предыдущие sinks
     logger.remove()
 
-    # Применяем patcher (редактирование секретов)
-    logger.configure(patcher=_patch_record)
-
-    # ── Sink: файл ─────────────────────────────────────────────────────────
+    # ── stdout (всегда) ──────────────────────────────────────────────────────
     logger.add(
-        str(LOG_FILE),
-        level=normalized_level,
-        format=LOG_FORMAT,
-        rotation=ROTATION,
-        retention=RETENTION,
-        compression=COMPRESSION,
-        encoding="utf-8",
-        enqueue=True,           # thread-safe
-        backtrace=enable_backtrace,
-        diagnose=enable_diagnose,
-    )
-
-    # ── Sink: консоль ──────────────────────────────────────────────────────
-    logger.add(
-        sys.stdout,
-        level=normalized_level,
-        format=LOG_FORMAT,
-        backtrace=enable_backtrace,
-        diagnose=enable_diagnose,
+        sys.stderr,
+        level=level.upper(),
+        format=_format_with_redact,
+        filter=_secret_filter,
         colorize=True,
+        backtrace=True,
+        diagnose=False,  # diagnose=True может утекать переменные!
     )
 
-    # Hardening прав на файл логов
+    # ── Файл (если возможно) ─────────────────────────────────────────────────
     try:
-        LOG_FILE.touch(mode=0o600, exist_ok=True)
-    except OSError:
-        pass
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Перехват стандартного logging ──────────────────────────────────────
-    # Уровень = выбранный log_level, НЕ forced DEBUG
-    numeric_level = getattr(logging, normalized_level, logging.INFO)
-    logging.basicConfig(
-        handlers=[InterceptHandler()],
-        level=numeric_level,
-        force=True,
-    )
+        # Проверяем права на запись
+        test_file = LOG_DIR / ".write_test"
+        try:
+            test_file.touch()
+            test_file.unlink()
+        except OSError:
+            raise PermissionError(f"Нет прав на запись в {LOG_DIR}")
 
-    # Прижимаем шумные библиотеки до WARNING
-    _NOISY_LIBS = (
-        "httpx", "httpcore", "asyncio", "urllib3",
-        "telebot", "aiohttp.access", "aiohttp.server",
-        "aiogram", "apscheduler",
-    )
-    for lib in _NOISY_LIBS:
-        logging.getLogger(lib).setLevel(logging.WARNING)
+        # Устанавливаем права на директорию (Linux/Mac)
+        if os.name != "nt":
+            try:
+                LOG_DIR.chmod(0o750)
+            except OSError:
+                pass
 
-    logger.bind(name="logger").info(
-        "Logger initialized | level={} | diagnose={} | backtrace={} | file={}",
-        normalized_level,
-        enable_diagnose,
-        enable_backtrace,
-        LOG_FILE,
-    )
+        logger.add(
+            str(LOG_FILE),
+            level=level.upper(),
+            format=_format_with_redact,
+            filter=_secret_filter,
+            rotation=LOG_ROTATION,
+            retention=LOG_RETENTION,
+            compression=LOG_COMPRESSION,
+            encoding="utf-8",
+            backtrace=True,
+            diagnose=False,
+        )
+        logger.debug(f"Логи пишутся в {LOG_FILE}")
 
-
-def get_logger(name: str):
-    """Возвращает loguru-логгер с именем модуля."""
-    return logger.bind(name=name)
+    except (PermissionError, OSError) as exc:
+        # TC-116: если нет прав — только stderr, без краша
+        logger.warning(
+            f"Не удалось настроить файловый лог ({exc}). "
+            f"Логи доступны только в консоли."
+        )

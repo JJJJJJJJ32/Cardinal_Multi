@@ -1,25 +1,3 @@
-"""
-Cardinal_Multi — точка входа.
-
-Pipeline запуска:
-1. sys.path setup
-2. Логгер (предварительный)
-3. Настройки (.env)
-4. Логгер (финальный с уровнем из .env)
-5. Encryption (инициализация ключа)
-6. init_db (создание всех таблиц)
-7. Совместимость плагинов Cardinal
-8. AccountManager (Модуль 1)
-9. LolzteamModule (Модуль 2)
-10. Cardinal Bridge (подключение хуков к Cardinal)
-11. [МОДУЛЬ 5] Scheduler (APScheduler)
-12. [МОДУЛЬ 5] EmergencyModule
-13. [МОДУЛЬ 5] StatsModule
-14. [МОДУЛЬ 5] BalanceModule
-15. [МОДУЛЬ 5] DiagnosticsChecker
-16. [МОДУЛЬ 5] UpdateChecker (проверка при старте)
-17. Rich dashboard / ожидание Ctrl+C
-"""
 
 from __future__ import annotations
 
@@ -27,161 +5,202 @@ import asyncio
 import sys
 from pathlib import Path
 
-# ── 1. sys.path ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. sys.path
+# ═══════════════════════════════════════════════════════════════════════════════
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# ── 2. Логгер (предварительный) ──────────────────────────────────────────────
-from modules.core.logger import setup_logger
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. Логгер (предварительный)
+# ═══════════════════════════════════════════════════════════════════════════════
+from modules.core.logger import setup_logger          # noqa: E402
 
 setup_logger("DEBUG")
 
-# ── 3. Настройки ─────────────────────────────────────────────────────────────
-from modules.core.config import get_settings
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. Настройки
+# ═══════════════════════════════════════════════════════════════════════════════
+from modules.core.config import get_settings           # noqa: E402
 
 settings = get_settings()
 
-# ── 4. Логгер (финальный) ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. Логгер (финальный)
+# ═══════════════════════════════════════════════════════════════════════════════
 setup_logger(settings.log_level)
 
-from loguru import logger
+from loguru import logger                              # noqa: E402
 
-logger.info("Cardinal_Multi запускается...")
+logger.info("Cardinal_Multi запускается …")
 
-# ── 5. Encryption ────────────────────────────────────────────────────────────
-from modules.core.encryption import Encryption
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. Encryption
+# ═══════════════════════════════════════════════════════════════════════════════
+from modules.core.encryption import Encryption         # noqa: E402
 
-Encryption()  # инициализация ключа (создаст data/secret.key если нет)
+Encryption()
 logger.info("Encryption инициализирован")
 
-# ── 6. База данных ───────────────────────────────────────────────────────────
-from modules.core.database import init_db
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6–8. Импорты (ленивые) — чтобы не дублировать try/except на каждый import
+# ═══════════════════════════════════════════════════════════════════════════════
+from modules.core.database import init_db                          # noqa: E402
+from modules.cardinal_bridge.compatibility import check_all_plugins  # noqa: E402
+from modules.cardinal_bridge.hooks import generate_plugin_file       # noqa: E402
+from modules.multi.account_manager import AccountManager             # noqa: E402
+from modules.lolzteam import LolzteamModule                         # noqa: E402
 
-# ── 7. Совместимость плагинов ────────────────────────────────────────────────
-from modules.cardinal_bridge.compatibility import check_all_plugins
-
-# ── 8. AccountManager ────────────────────────────────────────────────────────
-from modules.multi.account_manager import AccountManager
-
-# ── 9. LolzteamModule ────────────────────────────────────────────────────────
-from modules.lolzteam import LolzteamModule
-
-# ── 10. Cardinal Bridge ──────────────────────────────────────────────────────
-from modules.cardinal_bridge.hooks import generate_plugin_file
-
-# ── 11-16. Модуль 5 ──────────────────────────────────────────────────────────
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-from modules.stats.module import StatsModule
-from modules.balance.module import BalanceModule
-from modules.emergency.module import EmergencyModule
-from modules.diagnostics.checker import DiagnosticsChecker
-from modules.updates.checker import UpdateChecker
-
-# ── UI ───────────────────────────────────────────────────────────────────────
-from ui.console import ConsoleUI
+from apscheduler.schedulers.asyncio import AsyncIOScheduler          # noqa: E402
+from modules.stats.module import StatsModule                         # noqa: E402
+from modules.balance.module import BalanceModule                     # noqa: E402
+from modules.emergency.module import EmergencyModule                 # noqa: E402
+from modules.diagnostics.checker import DiagnosticsChecker           # noqa: E402
+from modules.updates.checker import UpdateChecker                    # noqa: E402
+from ui.console import ConsoleUI                                     # noqa: E402
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Утилита: обработчик «тихой смерти» asyncio.Task  ← FIX B-09
+# ═══════════════════════════════════════════════════════════════════════════════
+def _task_exception_handler(task: asyncio.Task) -> None:
+    """Callback для фоновых задач: логирует необработанное исключение."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            f"Фоновая задача [{task.get_name()}] упала с ошибкой: {exc!r}",
+            exc_info=exc,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 async def main() -> None:
-    """Основная точка входа Cardinal_Multi."""
+    """Основная корутина Cardinal_Multi."""
 
-    # ── БД: создать все таблицы ──────────────────────────────────────────────
-    logger.info("Инициализация базы данных...")
+    # ── 6. БД ────────────────────────────────────────────────────────────────
+    logger.info("Инициализация базы данных …")
     await init_db()
     logger.info("База данных готова")
 
-    # ── Совместимость плагинов Cardinal ──────────────────────────────────────
-    logger.info("Проверка совместимости плагинов...")
+    # ── 7. Совместимость плагинов ─────────────────────────────────────────────
+    logger.info("Проверка совместимости плагинов …")
     try:
         check_all_plugins()
     except Exception as exc:
         logger.warning(f"Проверка совместимости: {exc}")
 
-    # ── Cardinal Bridge: генерация plugin-файла ───────────────────────────────
-    logger.info("Генерация Cardinal bridge плагина...")
+    # ── 8. Cardinal Bridge ───────────────────────────────────────────────────
+    logger.info("Генерация Cardinal bridge-плагина …")
     try:
         generate_plugin_file()
-        logger.info("Cardinal bridge плагин готов")
+        logger.info("Cardinal bridge-плагин готов")
     except Exception as exc:
         logger.warning(f"Cardinal bridge: {exc}")
 
-    # ── Модуль 1: AccountManager ──────────────────────────────────────────────
-    logger.info("Запуск AccountManager...")
+    # ── 9. AccountManager ────────────────────────────────────────────────────
+    logger.info("Запуск AccountManager …")
     account_manager = AccountManager()
     try:
         await account_manager.setup()
         await account_manager.start()
         logger.info("AccountManager запущен")
     except Exception as exc:
-        logger.error(f"AccountManager ошибка: {exc}", exc_info=True)
-        # Не падаем — продолжаем запуск
+        logger.error(f"AccountManager: {exc}", exc_info=True)
 
-    # ── Модуль 2: LolzteamModule ──────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # 10. BotManager (Telegram)  ← FIX B-02
+    # ══════════════════════════════════════════════════════════════════════════
+    bot_manager = None
+    bot_manager_task: asyncio.Task | None = None
+
+    try:
+        from bot.bot_manager import BotManager  # noqa: E402  (aiogram)
+
+        bot_manager = BotManager()
+        # Передаём ОБЩИЙ экземпляр AccountManager (shared reference)
+        bot_manager.account_manager = account_manager
+
+        # BotManager.start() блокирует (polling) → запускаем как Task
+        bot_manager_task = asyncio.create_task(
+            bot_manager.start(),
+            name="bot_manager",
+        )
+        # FIX B-09: при падении Task логируем, а не теряем молча
+        bot_manager_task.add_done_callback(_task_exception_handler)
+
+        logger.info("BotManager (Telegram) запущен в фоне")
+    except ImportError:
+        logger.warning(
+            "BotManager не найден (bot/bot_manager.py отсутствует) — "
+            "Telegram-управление недоступно"
+        )
+    except Exception as exc:
+        logger.warning(f"BotManager не запущен: {exc}")
+
+    # ── 11. LolzteamModule ───────────────────────────────────────────────────
     lolzteam_module: LolzteamModule | None = None
 
-    lolz_token = (
-        getattr(settings, "lolz_api_token", None)
-        or getattr(settings, "lolzteam_token", None)
+    lolz_token = getattr(settings, "lolz_api_token", None) or getattr(
+        settings, "lolzteam_token", None
     )
     lolz_login = getattr(settings, "lolz_login", None)
     lolz_password = getattr(settings, "lolz_password", None)
 
     if lolz_token or (lolz_login and lolz_password):
-        logger.info("Запуск LolzteamModule...")
+        logger.info("Запуск LolzteamModule …")
         lolzteam_module = LolzteamModule()
         try:
             await lolzteam_module.setup()
             await lolzteam_module.start()
             logger.info("LolzteamModule запущен")
         except Exception as exc:
-            logger.error(f"LolzteamModule ошибка: {exc}", exc_info=True)
+            logger.error(f"LolzteamModule: {exc}", exc_info=True)
             lolzteam_module = None
     else:
         logger.warning(
             "LolzteamModule не запущен: "
-            "не задан LOLZ_API_TOKEN или LOLZ_LOGIN + LOLZ_PASSWORD"
+            "не задан LOLZ_API_TOKEN / (LOLZ_LOGIN + LOLZ_PASSWORD)"
         )
 
-    # =========================================================================
-    # МОДУЛЬ 5: Scheduler + вспомогательные модули
-    # =========================================================================
+    # ══════════════════════════════════════════════════════════════════════════
+    # 12–17. Scheduler + модули
+    # ══════════════════════════════════════════════════════════════════════════
 
-    # ── 11. APScheduler ───────────────────────────────────────────────────────
-    logger.info("Запуск APScheduler...")
+    # ── 12. APScheduler ──────────────────────────────────────────────────────
+    logger.info("Запуск APScheduler …")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.start()
     logger.info("APScheduler запущен")
 
-    # ── 12. EmergencyModule ───────────────────────────────────────────────────
-    # Стартуем первым — другие модули могут запрашивать is_paused()
-    logger.info("Запуск EmergencyModule...")
+    # ── 13. EmergencyModule ──────────────────────────────────────────────────
+    logger.info("Запуск EmergencyModule …")
     emergency_module = EmergencyModule()
     try:
         await emergency_module.setup()
         await emergency_module.start()
         logger.info("EmergencyModule запущен")
     except Exception as exc:
-        logger.error(f"EmergencyModule ошибка: {exc}", exc_info=True)
+        logger.error(f"EmergencyModule: {exc}", exc_info=True)
 
-    # ── 13. StatsModule ───────────────────────────────────────────────────────
-    # Подписывается на ORDER_COMPLETED / ITEM_PURCHASED / ITEM_DELIVERED
-    logger.info("Запуск StatsModule...")
+    # ── 14. StatsModule ──────────────────────────────────────────────────────
+    logger.info("Запуск StatsModule …")
     stats_module = StatsModule(scheduler=scheduler)
     try:
         await stats_module.setup()
         await stats_module.start()
         logger.info("StatsModule запущен")
     except Exception as exc:
-        logger.error(f"StatsModule ошибка: {exc}", exc_info=True)
+        logger.error(f"StatsModule: {exc}", exc_info=True)
 
-    # ── 14. BalanceModule ─────────────────────────────────────────────────────
-    # Нужен accounts_getter — берём из account_manager
-    logger.info("Запуск BalanceModule...")
+    # ── 15. BalanceModule ────────────────────────────────────────────────────
+    logger.info("Запуск BalanceModule …")
     balance_module = BalanceModule(
         scheduler=scheduler,
-        # get_active_accounts() — метод AccountManager,
-        # возвращает List[Account] (активные аккаунты из БД)
         accounts_getter=account_manager.get_active_accounts,
     )
     try:
@@ -189,22 +208,20 @@ async def main() -> None:
         await balance_module.start()
         logger.info("BalanceModule запущен")
     except Exception as exc:
-        logger.error(f"BalanceModule ошибка: {exc}", exc_info=True)
+        logger.error(f"BalanceModule: {exc}", exc_info=True)
 
-    # ── 15. DiagnosticsChecker ────────────────────────────────────────────────
-    # Stateless — создаём, не стартуем (вызывается по запросу)
+    # ── 16. DiagnosticsChecker ───────────────────────────────────────────────
     logger.info("DiagnosticsChecker готов")
-    diagnostics = DiagnosticsChecker()
+    _diagnostics = DiagnosticsChecker()  # noqa: F841
 
-    # ── 16. UpdateChecker ─────────────────────────────────────────────────────
-    logger.info("Проверка обновлений Cardinal_Multi...")
+    # ── 17. UpdateChecker ────────────────────────────────────────────────────
+    logger.info("Проверка обновлений …")
     update_checker = UpdateChecker()
     try:
-        await update_checker.check()  # 1 раз при старте
+        await update_checker.check()
     except Exception as exc:
-        logger.warning(f"UpdateChecker (старт): {exc}")
+        logger.warning(f"UpdateChecker (первый запуск): {exc}")
 
-    # Повторная проверка раз в сутки
     scheduler.add_job(
         update_checker.check,
         trigger="interval",
@@ -212,12 +229,12 @@ async def main() -> None:
         id="update_check_daily",
         replace_existing=True,
     )
-    logger.info("UpdateChecker: повторная проверка запланирована (каждые 24ч)")
+    logger.info("UpdateChecker: следующая проверка через 24 ч")
 
-    # =========================================================================
-    # UI / ожидание Ctrl+C
-    # =========================================================================
-    logger.info("Cardinal_Multi запущен. Нажми Ctrl+C для остановки.")
+    # ══════════════════════════════════════════════════════════════════════════
+    # 18. Rich Console UI / Ctrl+C
+    # ══════════════════════════════════════════════════════════════════════════
+    logger.info("Cardinal_Multi полностью запущен. Ctrl+C для остановки.")
 
     ui = ConsoleUI()
     try:
@@ -226,7 +243,7 @@ async def main() -> None:
             lolzteam_module=lolzteam_module,
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Получен сигнал остановки...")
+        logger.info("Получен сигнал остановки …")
     finally:
         await _shutdown(
             account_manager=account_manager,
@@ -235,76 +252,103 @@ async def main() -> None:
             emergency_module=emergency_module,
             stats_module=stats_module,
             balance_module=balance_module,
+            bot_manager=bot_manager,
+            bot_manager_task=bot_manager_task,
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHUTDOWN
+# ═══════════════════════════════════════════════════════════════════════════════
 async def _shutdown(
+    *,
     account_manager: AccountManager,
     lolzteam_module: LolzteamModule | None,
     scheduler: AsyncIOScheduler,
     emergency_module: EmergencyModule,
     stats_module: StatsModule,
     balance_module: BalanceModule,
+    bot_manager,
+    bot_manager_task: asyncio.Task | None,
 ) -> None:
     """
-    Корректная остановка всех модулей.
+    Graceful shutdown в обратном порядке запуска.
 
-    Порядок остановки (обратный порядку запуска):
-    1. BalanceModule      — останавливаем фоновые проверки
-    2. StatsModule        — останавливаем автоочистку
-    3. EmergencyModule    — снимаем все паузы
-    4. APScheduler        — останавливаем планировщик
-    5. LolzteamModule     — закрываем сессии Lolzteam
-    6. AccountManager     — останавливаем subprocess Cardinal
+    Порядок:
+      0. BotManager  (иначе будет дёргать account_manager после его остановки)
+      1. BalanceModule
+      2. StatsModule
+      3. EmergencyModule
+      4. APScheduler
+      5. LolzteamModule
+      6. AccountManager
     """
-    logger.info("Остановка Cardinal_Multi...")
+    logger.info("Остановка Cardinal_Multi …")
 
-    # ── BalanceModule ─────────────────────────────────────────────────────────
+    # ── 0. BotManager ────────────────────────────────────────────────────────
+    if bot_manager is not None:
+        try:
+            await bot_manager.stop()
+            logger.info("BotManager остановлен")
+        except Exception as exc:
+            logger.error(f"BotManager stop: {exc}")
+
+    if bot_manager_task is not None and not bot_manager_task.done():
+        bot_manager_task.cancel()
+        try:
+            await bot_manager_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # ── 1. BalanceModule ─────────────────────────────────────────────────────
     try:
         await balance_module.stop()
         logger.info("BalanceModule остановлен")
     except Exception as exc:
-        logger.error(f"BalanceModule stop ошибка: {exc}")
+        logger.error(f"BalanceModule stop: {exc}")
 
-    # ── StatsModule ───────────────────────────────────────────────────────────
+    # ── 2. StatsModule ───────────────────────────────────────────────────────
     try:
         await stats_module.stop()
         logger.info("StatsModule остановлен")
     except Exception as exc:
-        logger.error(f"StatsModule stop ошибка: {exc}")
+        logger.error(f"StatsModule stop: {exc}")
 
-    # ── EmergencyModule ───────────────────────────────────────────────────────
+    # ── 3. EmergencyModule ───────────────────────────────────────────────────
     try:
         await emergency_module.stop()
         logger.info("EmergencyModule остановлен")
     except Exception as exc:
-        logger.error(f"EmergencyModule stop ошибка: {exc}")
+        logger.error(f"EmergencyModule stop: {exc}")
 
-    # ── APScheduler ───────────────────────────────────────────────────────────
+    # ── 4. APScheduler ───────────────────────────────────────────────────────
     try:
         scheduler.shutdown(wait=False)
         logger.info("APScheduler остановлен")
     except Exception as exc:
-        logger.error(f"APScheduler shutdown ошибка: {exc}")
+        logger.error(f"APScheduler: {exc}")
 
-    # ── LolzteamModule ────────────────────────────────────────────────────────
+    # ── 5. LolzteamModule ────────────────────────────────────────────────────
     if lolzteam_module is not None:
         try:
             await lolzteam_module.stop()
             logger.info("LolzteamModule остановлен")
         except Exception as exc:
-            logger.error(f"LolzteamModule stop ошибка: {exc}")
+            logger.error(f"LolzteamModule stop: {exc}")
 
-    # ── AccountManager ────────────────────────────────────────────────────────
+    # ── 6. AccountManager ────────────────────────────────────────────────────
     try:
         await account_manager.stop()
         logger.info("AccountManager остановлен")
     except Exception as exc:
-        logger.error(f"AccountManager stop ошибка: {exc}")
+        logger.error(f"AccountManager stop: {exc}")
 
     logger.info("Cardinal_Multi остановлен. До свидания!")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
         asyncio.run(main())

@@ -1,294 +1,138 @@
 """
-modules/core/events.py
-──────────────────────
-Внутренняя шина событий Cardinal_Multi (не FunPayAPI EventTypes!).
-Позволяет модулям общаться между собой без прямых зависимостей.
+EventBus — внутренняя шина событий Cardinal_Multi.
 
-Паттерн: publish/subscribe (EventBus).
-Thread-safe: да (Lock + asyncio-совместимость).
-
-Типы событий:
-    FunPay-события (от Cardinal через bridge):
-        NEW_ORDER, NEW_MESSAGE, LOT_CHANGED,
-        ORDER_COMPLETED, ORDER_STATUS_CHANGED
-
-    Мультиаккаунт-события:
-        ACCOUNT_ERROR, ACCOUNT_STARTED, ACCOUNT_STOPPED
-
-    Lolzteam-события (для другого AI):
-        SEARCH_STARTED, SEARCH_COMPLETED,
-        ITEM_PURCHASED, ITEM_DELIVERED
-
-    Системные:
-        BALANCE_LOW, SYSTEM_ERROR
+Фиксы:
+  B-20  / TC-083 — один handler не должен ломать остальных
+  TC-084 — emit несуществующего типа
+  TC-085 — emit с None payload
+  TC-086 — burst-устойчивость (без блокировки)
 """
 
 from __future__ import annotations
 
 import asyncio
-from enum import Enum, auto
-from threading import Lock
-from typing import Any, Callable, Coroutine
+import enum
+from collections import defaultdict
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
 from loguru import logger
 
 
-# ─── Типы событий ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# EventType enum
+# ═══════════════════════════════════════════════════════════════════════════════
+class EventType(str, enum.Enum):
+    """Все типы событий, поддерживаемые системой."""
 
-class EventType(str, Enum):
-    """
-    Все типы событий Cardinal_Multi.
-    Строковый Enum для удобства логирования и сериализации.
-    """
+    # Заказы
+    NEW_ORDER = "new_order"
+    ORDER_COMPLETED = "order_completed"
 
-    # ── FunPay-события ────────────────────────────────────────────────────────
-    NEW_ORDER            = "new_order"
-    """Новый заказ на FunPay."""
+    # Сообщения
+    NEW_MESSAGE = "new_message"
 
-    NEW_MESSAGE          = "new_message"
-    """Новое сообщение от покупателя."""
+    # Товары
+    ITEM_PURCHASED = "item_purchased"
+    ITEM_DELIVERED = "item_delivered"
 
-    LOT_CHANGED          = "lot_changed"
-    """Изменился статус лота."""
+    # Аккаунты
+    ACCOUNT_STARTED = "account_started"
+    ACCOUNT_STOPPED = "account_stopped"
+    ACCOUNT_ERROR = "account_error"
 
-    ORDER_COMPLETED      = "order_completed"
-    """Заказ выполнен и подтверждён покупателем."""
-
-    ORDER_STATUS_CHANGED = "order_status_changed"
-    """Статус заказа изменился (оплачен/возврат и т.д.)."""
-
-    # ── Мультиаккаунт ─────────────────────────────────────────────────────────
-    ACCOUNT_ERROR        = "account_error"
-    """Аккаунт FunPay упал или недоступен."""
-
-    ACCOUNT_STARTED      = "account_started"
-    """Аккаунт успешно запущен."""
-
-    ACCOUNT_STOPPED      = "account_stopped"
-    """Аккаунт остановлен (штатно или по ошибке)."""
-
-    # ── Lolzteam (для другого AI-модуля) ─────────────────────────────────────
-    SEARCH_STARTED       = "search_started"
-    """Запущен поиск товаров на Lolzteam."""
-
-    SEARCH_COMPLETED     = "search_completed"
-    """Поиск товаров на Lolzteam завершён."""
-
-    ITEM_PURCHASED       = "item_purchased"
-    """Товар куплен на Lolzteam."""
-
-    ITEM_DELIVERED       = "item_delivered"
-    """Купленный товар выдан покупателю на FunPay."""
-
-    # ── Системные ────────────────────────────────────────────────────────────
-    BALANCE_LOW          = "balance_low"
-    """Баланс аккаунта ниже порогового значения."""
-
-    SYSTEM_ERROR         = "system_error"
-    """Критическая системная ошибка."""
+    # Система
+    SYSTEM_ERROR = "system_error"
+    SYSTEM_WARNING = "system_warning"
 
 
-# ─── Типы хэндлеров ───────────────────────────────────────────────────────────
-
-# Sync handler: принимает EventType + данные
-SyncHandler = Callable[[EventType, Any], None]
-# Async handler: возвращает корутину
-AsyncHandler = Callable[[EventType, Any], Coroutine[Any, Any, None]]
-Handler = SyncHandler | AsyncHandler
+# Тип для handler'а — синхронная или асинхронная функция
+HandlerType = Callable[..., Union[None, Coroutine[Any, Any, None]]]
 
 
-# ─── EventBus ─────────────────────────────────────────────────────────────────
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# EventBus (Singleton)
+# ═══════════════════════════════════════════════════════════════════════════════
 class EventBus:
     """
-    Шина событий Cardinal_Multi.
+    Простая шина событий с pub/sub.
 
-    Синглтон. Поддерживает синхронные и асинхронные подписчики.
-    Thread-safe для subscribe/unsubscribe.
-    emit() можно вызывать из любого потока.
-
-    Пример использования::
-
-        bus = EventBus()
-
-        # Подписка (sync)
-        def on_new_order(event: EventType, data: dict) -> None:
-            print(f"Новый заказ: {data['order_id']}")
-
-        bus.subscribe(EventType.NEW_ORDER, on_new_order)
-
-        # Публикация
-        bus.emit(EventType.NEW_ORDER, {"order_id": "ABC123", "account_id": 1})
-
-        # Отписка
-        bus.unsubscribe(EventType.NEW_ORDER, on_new_order)
+    Гарантии:
+      - Один упавший handler НЕ блокирует остальных (FIX B-20)
+      - emit() с неизвестным EventType — тихий пропуск (TC-084)
+      - emit() с payload=None допустим (TC-085)
     """
 
-    _instance: "EventBus | None" = None
+    _instance: Optional["EventBus"] = None
 
     def __new__(cls) -> "EventBus":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._handlers: dict[EventType, list[Handler]] = {}
-            cls._instance._lock = Lock()
+            cls._instance._handlers: Dict[str, List[HandlerType]] = defaultdict(list)
+            cls._instance._initialized = True
         return cls._instance
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Subscribe / Unsubscribe
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─── Подписка ────────────────────────────────────────────────────────────
+    def subscribe(self, event_type: Union[EventType, str], handler: HandlerType) -> None:
+        """Подписать handler на событие."""
+        key = event_type.value if isinstance(event_type, EventType) else str(event_type)
+        self._handlers[key].append(handler)
+        logger.debug(f"EventBus: подписан {handler.__name__} на {key}")
 
-    def subscribe(self, event: EventType, handler: Handler) -> None:
-        """
-        Подписывает хэндлер на событие.
+    def unsubscribe(self, event_type: Union[EventType, str], handler: HandlerType) -> None:
+        """Отписать handler от события."""
+        key = event_type.value if isinstance(event_type, EventType) else str(event_type)
+        try:
+            self._handlers[key].remove(handler)
+            logger.debug(f"EventBus: отписан {handler.__name__} от {key}")
+        except ValueError:
+            logger.warning(
+                f"EventBus: handler {handler.__name__} не найден для {key}"
+            )
 
-        :param event: тип события из EventType.
-        :param handler: функция-обработчик (sync или async).
-
-        Async-хэндлеры запускаются через asyncio.run_coroutine_threadsafe()
-        если event loop запущен, иначе через asyncio.run().
-        """
-        with self._lock:
-            if event not in self._handlers:
-                self._handlers[event] = []
-            if handler not in self._handlers[event]:
-                self._handlers[event].append(handler)
-                logger.debug(
-                    "EventBus: подписка на '{}' → {}.{}",
-                    event.value,
-                    handler.__module__,
-                    handler.__qualname__,
-                )
-
-    def unsubscribe(self, event: EventType, handler: Handler) -> None:
-        """
-        Отписывает хэндлер от события.
-
-        :param event: тип события.
-        :param handler: ранее подписанный хэндлер.
-        """
-        with self._lock:
-            if event in self._handlers:
-                try:
-                    self._handlers[event].remove(handler)
-                    logger.debug(
-                        "EventBus: отписка от '{}' → {}.{}",
-                        event.value,
-                        handler.__module__,
-                        handler.__qualname__,
-                    )
-                except ValueError:
-                    pass
-
-    def subscribe_many(
-        self, subscriptions: dict[EventType, Handler | list[Handler]]
+    # ─── Публикация ──────────────────────────────────────────────────────────
+    async def emit(
+        self,
+        event_type: Union[EventType, str],
+        payload: Any = None,
     ) -> None:
         """
-        Подписывает несколько хэндлеров за один вызов.
+        Отправить событие всем подписчикам.
 
-        :param subscriptions: словарь {EventType: handler или [handler1, handler2]}.
-
-        Пример::
-
-            bus.subscribe_many({
-                EventType.NEW_ORDER:   handle_order,
-                EventType.NEW_MESSAGE: [handle_msg_1, handle_msg_2],
-            })
+        TC-084: если нет подписчиков — тихий пропуск.
+        TC-085: payload может быть None.
+        B-20 / TC-083: каждый handler обёрнут в try/except.
         """
-        for event, handlers in subscriptions.items():
-            if isinstance(handlers, list):
-                for h in handlers:
-                    self.subscribe(event, h)
-            else:
-                self.subscribe(event, handlers)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Emit
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def emit(self, event: EventType, data: Any = None) -> None:
-        """
-        Публикует событие всем подписчикам.
-
-        Sync-хэндлеры вызываются немедленно в текущем потоке.
-        Async-хэндлеры запускаются в event loop (если он есть)
-        или создают новый через asyncio.run().
-
-        Ошибка в одном хэндлере не прерывает вызов остальных.
-
-        :param event: тип события.
-        :param data: произвольные данные события (dict, объект, None).
-        """
-        with self._lock:
-            handlers = list(self._handlers.get(event, []))
+        key = event_type.value if isinstance(event_type, EventType) else str(event_type)
+        handlers = self._handlers.get(key)
 
         if not handlers:
+            logger.debug(f"EventBus: нет подписчиков на '{key}', пропуск")
             return
 
-        logger.debug("EventBus: emit '{}' → {} подписчиков", event.value, len(handlers))
+        logger.debug(f"EventBus: emit '{key}' → {len(handlers)} handler(s)")
 
         for handler in handlers:
             try:
-                if asyncio.iscoroutinefunction(handler):
-                    self._call_async(handler, event, data)
-                else:
-                    handler(event, data)
+                result = handler(payload)
+                # Если handler — корутина, дожидаемся
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as exc:
+                # ── FIX B-20 / TC-083 ────────────────────────────────────────
+                # Один handler упал — логируем и продолжаем
                 logger.error(
-                    "EventBus: ошибка в хэндлере {}.{} для события '{}': {}",
-                    handler.__module__,
-                    handler.__qualname__,
-                    event.value,
-                    exc,
+                    f"EventBus: handler '{handler.__name__}' на событие '{key}' "
+                    f"упал с ошибкой: {exc!r}",
+                    exc_info=True,
                 )
 
-    def _call_async(self, handler: AsyncHandler, event: EventType, data: Any) -> None:
-        """
-        Вызывает async-хэндлер.
+    # ─── Утилиты ─────────────────────────────────────────────────────────────
+    def clear(self) -> None:
+        """Удалить все подписки (для тестов)."""
+        self._handlers.clear()
+        logger.debug("EventBus: все подписки удалены")
 
-        Если есть работающий event loop — schedules coroutine в нём.
-        Иначе — создаёт новый event loop.
-
-        :param handler: async функция-обработчик.
-        :param event: тип события.
-        :param data: данные события.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-            # Есть работающий loop — планируем корутину в нём
-            asyncio.run_coroutine_threadsafe(handler(event, data), loop)
-        except RuntimeError:
-            # Нет работающего loop — запускаем синхронно
-            asyncio.run(handler(event, data))
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Utility
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def clear(self, event: EventType | None = None) -> None:
-        """
-        Удаляет всех подписчиков.
-
-        :param event: если указан — очищает только этот тип события.
-                      Если None — очищает все события.
-        """
-        with self._lock:
-            if event is not None:
-                self._handlers.pop(event, None)
-            else:
-                self._handlers.clear()
-        logger.debug("EventBus: очищены подписчики (event={})", event)
-
-    def subscriber_count(self, event: EventType) -> int:
-        """
-        Возвращает количество подписчиков на событие.
-
-        :param event: тип события.
-        :return: количество подписчиков.
-        """
-        with self._lock:
-            return len(self._handlers.get(event, []))
-
-    def __repr__(self) -> str:
-        with self._lock:
-            total = sum(len(v) for v in self._handlers.values())
-        return f"<EventBus: {len(self._handlers)} событий, {total} подписчиков>"
+    def handler_count(self, event_type: Union[EventType, str]) -> int:
+        """Количество подписчиков на событие."""
+        key = event_type.value if isinstance(event_type, EventType) else str(event_type)
+        return len(self._handlers.get(key, []))
