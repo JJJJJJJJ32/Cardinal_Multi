@@ -1,12 +1,15 @@
 """
 setup.py — мастер первоначальной настройки Cardinal_Multi.
 
-Rich-интерфейс для:
-- Настройки аккаунтов FunPay
-- Настройки Telegram-ботов
-- Проверки подключений
-- Создания .env файла
-- Инициализации БД
+Запуск: python setup.py
+
+Выполняет:
+1) Сбор настроек от пользователя через Rich-интерфейс
+2) Best-effort проверку golden_key (FunPayAPI) и Telegram-токена
+3) Запись .env
+4) Инициализацию Encryption (data/secret.key)
+5) Создание БД (data/cardinal_multi.db)
+6) Сохранение аккаунтов в БД (с шифрованием golden_key)
 """
 
 from __future__ import annotations
@@ -14,403 +17,354 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-
-# ─── sys.path ─────────────────────────────────────────────────────────────────
-_root = Path(__file__).parent
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
+from typing import Any
 
 from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Prompt, Confirm, IntPrompt
-from rich.text import Text
-from rich import box
+from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
+
+# ── sys.path: чтобы работали импорты из корня проекта ────────────────────────
+ROOT = Path(__file__).parent.resolve()
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 console = Console()
 
-ENV_FILE = Path(".env")
-ENV_EXAMPLE_FILE = Path(".env.example")
+ENV_FILE = ROOT / ".env"
 
-# ─── Вспомогательные функции ──────────────────────────────────────────────────
 
-def _print_step(step: int, total: int, title: str) -> None:
-    """Печатает заголовок шага."""
-    console.print(f"\n[bold cyan]Шаг {step}/{total}:[/bold cyan] [bold white]{title}[/bold white]")
+# ─── UI-helpers ──────────────────────────────────────────────────────────────
+def _step(n: int, total: int, title: str) -> None:
+    console.print(f"\n[bold cyan]Шаг {n}/{total}:[/bold cyan] [bold white]{title}[/bold white]")
     console.print(Rule(style="cyan"))
 
 
-def _print_success(msg: str) -> None:
+def _ok(msg: str) -> None:
     console.print(f"[bold green]✅[/bold green] {msg}")
 
 
-def _print_error(msg: str, hint: str | None = None) -> None:
+def _warn(msg: str) -> None:
+    console.print(f"[bold yellow]⚠[/bold yellow]  {msg}")
+
+
+def _err(msg: str) -> None:
     console.print(f"[bold red]❌[/bold red] {msg}")
-    if hint:
-        console.print(f"   [dim yellow]→ {hint}[/dim yellow]")
 
 
-def _print_warning(msg: str) -> None:
-    console.print(f"[bold yellow]⚠️[/bold yellow]  {msg}")
+def _ask_float(prompt: str, default: float, min_val: float = 0.0) -> float:
+    """Запрашивает float с валидацией."""
+    while True:
+        raw = Prompt.ask(prompt, default=str(default)).strip()
+        try:
+            v = float(raw)
+            if v < min_val:
+                _err(f"Значение должно быть >= {min_val}.")
+                continue
+            return v
+        except ValueError:
+            _err("Введи число (например: 1.5)")
 
 
-def _print_info(msg: str) -> None:
-    console.print(f"[bold cyan]ℹ[/bold cyan]  {msg}")
+def _ask_int(prompt: str, default: int, min_val: int = 1, max_val: int = 5) -> int:
+    """Запрашивает int с валидацией диапазона."""
+    while True:
+        raw = Prompt.ask(prompt, default=str(default)).strip()
+        try:
+            v = int(raw)
+            if not min_val <= v <= max_val:
+                _err(f"Введи число от {min_val} до {max_val}.")
+                continue
+            return v
+        except ValueError:
+            _err("Введи целое число.")
 
 
-# ─── Проверка golden_key ───────────────────────────────────────────────────────
-
+# ─── Проверки подключения ────────────────────────────────────────────────────
 async def _check_golden_key(golden_key: str) -> tuple[bool, str | None]:
     """
-    Проверяет golden_key через FunPayAPI.
-
-    :param golden_key: golden_key для проверки.
-    :return: (success, username или None).
+    Best-effort проверка golden_key через FunPayAPI.
+    Возвращает (успех, username или сообщение об ошибке).
     """
     try:
-        # Пробуем импортировать FunPayAPI (Cardinal должен быть установлен)
         from FunPayAPI import Account  # type: ignore
+
         account = Account(golden_key=golden_key)
-        await asyncio.get_event_loop().run_in_executor(None, account.get)
-        return True, getattr(account, "username", None)
+        await asyncio.to_thread(account.get)
+        username: str | None = getattr(account, "username", None)
+        return True, username
     except ImportError:
-        # FunPayAPI недоступен в текущем окружении
-        _print_warning(
-            "FunPayAPI недоступен для проверки golden_key. "
-            "Ключ будет сохранён без проверки."
-        )
+        _warn("FunPayAPI не найден — golden_key принят без проверки.")
         return True, None
     except Exception as exc:
         return False, str(exc)
 
 
-# ─── Проверка Telegram ────────────────────────────────────────────────────────
-
-async def _check_telegram(token: str, chat_id: str) -> bool:
+async def _check_telegram(token: str, chat_id: int) -> bool:
     """
-    Проверяет Telegram бот-токен, отправляя тестовое сообщение.
-
-    :param token: токен Telegram-бота.
-    :param chat_id: Telegram chat_id.
-    :return: True если успешно.
+    Best-effort проверка Telegram-токена.
+    Отправляет тестовое сообщение через pyTelegramBotAPI (sync).
     """
     try:
         import telebot  # type: ignore
 
         bot = telebot.TeleBot(token)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: bot.send_message(
-                chat_id,
-                "✅ Cardinal_Multi подключён! Это тестовое сообщение.",
-            )
+        await asyncio.to_thread(
+            bot.send_message,
+            chat_id,
+            "✅ Cardinal_Multi подключён! Это тестовое сообщение от setup.py.",
         )
         return True
     except ImportError:
-        _print_warning("pyTelegramBotAPI не установлен. Telegram не проверен.")
+        _warn("pyTelegramBotAPI не установлен — Telegram проверка пропущена.")
         return True
     except Exception as exc:
-        _print_error(f"Ошибка Telegram: {exc}")
+        _err(f"Telegram ошибка: {exc}")
         return False
 
 
-# ─── Сохранение .env ──────────────────────────────────────────────────────────
-
-def _save_env(config: dict) -> None:
-    """
-    Сохраняет конфигурацию в .env файл.
-
-    :param config: словарь с настройками.
-    """
-    lines = [
-        "# Cardinal_Multi — файл конфигурации",
-        "# Автоматически создан setup.py",
+# ─── Запись .env ─────────────────────────────────────────────────────────────
+def _save_env(cfg: dict[str, Any]) -> None:
+    """Сохраняет собранные настройки в .env."""
+    lines: list[str] = [
+        "# Cardinal_Multi — конфигурация",
+        "# Создан автоматически setup.py",
         "# НЕ добавляй этот файл в git!",
         "",
-        "# Логирование",
-        f"LOG_LEVEL={config.get('log_level', 'INFO')}",
+        "# Система",
+        f"LOG_LEVEL={cfg.get('log_level', 'INFO')}",
+        f"MAX_ACCOUNTS={cfg.get('max_accounts', 1)}",
+        f"REQUEST_DELAY={cfg.get('request_delay', 1.0)}",
         "",
-        "# Аккаунты",
-        f"MAX_ACCOUNTS={config.get('max_accounts', 1)}",
+        "# Telegram",
+        f"MAIN_TELEGRAM_TOKEN={cfg.get('main_telegram_token', '')}",
+        f"MAIN_TELEGRAM_CHAT_ID={cfg.get('main_telegram_chat_id', '')}",
         "",
-        "# Telegram (главный бот)",
-        f"MAIN_TELEGRAM_TOKEN={config.get('main_telegram_token', '')}",
-        f"MAIN_TELEGRAM_CHAT_ID={config.get('main_telegram_chat_id', '')}",
+        "# Мониторинг баланса (рубли)",
+        f"BALANCE_ALERT_THRESHOLD={cfg.get('balance_alert_threshold', 100.0)}",
         "",
-        "# Порог уведомления о балансе",
-        f"BALANCE_ALERT_THRESHOLD={config.get('balance_alert_threshold', 100.0)}",
-        "",
-        "# Lolzteam (заполняется другим модулем)",
-        "LOLZTEAM_TOKEN=",
-        "",
-        "# AI консультант (заполняется другим модулем)",
+        "# OpenAI (опционально)",
         "OPENAI_API_KEY=",
+        "",
+        "# Lolzteam (заполни один из способов или оба оставь пустыми)",
+        "LOLZ_API_TOKEN=",
+        "LOLZ_LOGIN=",
+        "LOLZ_PASSWORD=",
+        "LOLZ_CLIENT_ID=",
+        "LOLZ_CLIENT_SECRET=",
+        "LOLZ_SECRET_PHRASE=",
+        "",
     ]
-
     ENV_FILE.write_text("\n".join(lines), encoding="utf-8")
 
 
-# ─── Главный мастер настройки ─────────────────────────────────────────────────
-
+# ─── Главный сценарий ────────────────────────────────────────────────────────
 async def run_setup() -> None:
-    """Главная функция мастера настройки."""
+    console.print(Rule("[bold magenta]Cardinal_Multi — мастер настройки[/bold magenta]"))
 
-    # ── Заголовок ─────────────────────────────────────────────────────────────
-    console.print(Panel(
-        "[bold white]CARDINAL MULTI v1.0.0[/bold white]\n"
-        "[dim]Мастер первоначальной настройки[/dim]",
-        box=box.DOUBLE,
-        style="bold blue",
-        expand=False,
-    ))
-    console.print()
-
-    # ── Проверка существующей настройки ───────────────────────────────────────
+    # Проверка: .env уже существует
     if ENV_FILE.exists():
-        console.print(Panel(
-            "[bold white]Настройки уже существуют.[/bold white]\n\n"
-            "[bold cyan][1][/bold cyan] Изменить настройки\n"
-            "[bold cyan][2][/bold cyan] Запустить программу",
-            box=box.ROUNDED,
-            border_style="yellow",
-        ))
-        choice = Prompt.ask(
-            "Выбор",
-            choices=["1", "2"],
-            default="2",
+        overwrite = Confirm.ask(
+            f"[yellow].env уже существует ({ENV_FILE}). Перезаписать?[/yellow]",
+            default=False,
         )
-        if choice == "2":
-            console.print("[bold green]Запуск Cardinal_Multi...[/bold green]")
+        if not overwrite:
+            _warn("Отмена. .env не изменён.")
             return
 
-    # ── Данные для сохранения ─────────────────────────────────────────────────
-    env_config: dict = {"log_level": "INFO"}
-    accounts_data: list[dict] = []
+    TOTAL = 5
+    cfg: dict[str, Any] = {}
 
-    total_steps = 5
+    # ── Шаг 1: Базовые настройки ─────────────────────────────────────────────
+    _step(1, TOTAL, "Базовые настройки")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 1 — Режим работы
-    # ─────────────────────────────────────────────────────────────────────────
-    _print_step(1, total_steps, "Режим работы")
+    cfg["log_level"] = Prompt.ask(
+        "Уровень логирования",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+    )
 
-    console.print("Сколько аккаунтов FunPay?")
-    console.print("[bold cyan][1][/bold cyan] Один аккаунт")
-    console.print("[bold cyan][2][/bold cyan] Несколько аккаунтов (до 5)")
+    console.print("\nКоличество аккаунтов FunPay:")
+    console.print("  [cyan]1[/cyan] — Один аккаунт")
+    console.print("  [cyan]2..5[/cyan] — Несколько аккаунтов")
 
-    mode = Prompt.ask("Выбор", choices=["1", "2"], default="1")
-    multi_mode = (mode == "2")
-    max_accounts = 5 if multi_mode else 1
-    env_config["max_accounts"] = max_accounts
+    max_accounts = _ask_int(
+        "Максимум аккаунтов [1-5]",
+        default=1,
+        min_val=1,
+        max_val=5,
+    )
+    cfg["max_accounts"] = max_accounts
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 2 — Аккаунты FunPay
-    # ─────────────────────────────────────────────────────────────────────────
-    _print_step(2, total_steps, "Аккаунт FunPay")
+    cfg["request_delay"] = _ask_float(
+        "Задержка между запросами к FunPay (сек)",
+        default=1.0,
+        min_val=0.0,
+    )
 
-    account_count = 1
-    while account_count <= max_accounts:
-        console.print(f"\n[bold white]Аккаунт {account_count}[/bold white]")
+    cfg["balance_alert_threshold"] = _ask_float(
+        "Порог уведомления о балансе (рубли, 0 = отключить)",
+        default=100.0,
+        min_val=0.0,
+    )
 
-        # Инструкция
-        _print_info(
-            "Где найти golden_key:\n"
-            "   Браузер → FunPay → F12 → Application → Cookies → golden_key"
+    # ── Шаг 2: Аккаунты FunPay ───────────────────────────────────────────────
+    _step(2, TOTAL, "Аккаунты FunPay")
+
+    accounts_data: list[dict[str, Any]] = []
+
+    for idx in range(1, max_accounts + 1):
+        console.print(f"\n[bold white]Аккаунт {idx} из {max_accounts}[/bold white]")
+
+        # Запрос golden_key с повтором при ошибке
+        while True:
+            golden_key = Prompt.ask("  golden_key").strip()
+            if not golden_key:
+                _err("golden_key не может быть пустым.")
+                continue
+
+            console.print("  [dim]Проверка подключения к FunPay...[/dim]")
+            ok, user_or_err = await _check_golden_key(golden_key)
+
+            if ok:
+                display = f"@{user_or_err}" if user_or_err else f"Account {idx}"
+                _ok(f"Подключение OK: {display}")
+                break
+
+            _err(f"Ошибка: {user_or_err}")
+            if not Confirm.ask("  Попробовать снова?", default=True):
+                _warn("Аккаунт пропущен.")
+                golden_key = None  # type: ignore[assignment]
+                break
+
+        if golden_key is None:
+            continue
+
+        name = Prompt.ask(
+            "  Имя аккаунта (для отображения)",
+            default=f"@{user_or_err}" if user_or_err else f"Account {idx}",
+        ).strip()
+
+        accounts_data.append(
+            {
+                "golden_key": golden_key,
+                "name": name,
+                "username": user_or_err,
+                "is_primary": idx == 1,
+            }
         )
 
-        while True:
-            golden_key = Prompt.ask(f"  golden_key для аккаунта {account_count}").strip()
-            if not golden_key:
-                _print_error("golden_key не может быть пустым.")
-                continue
-
-            console.print("  [dim]Проверка подключения...[/dim]")
-            success, username_or_err = await _check_golden_key(golden_key)
-
-            if success:
-                display = f"@{username_or_err}" if username_or_err else "(имя получено при запуске)"
-                _print_success(f"Подключён: {display}")
-                account_name = Prompt.ask(
-                    "  Имя аккаунта (для отображения)",
-                    default=display,
-                )
-                accounts_data.append({
-                    "golden_key": golden_key,
-                    "name":       account_name,
-                    "username":   username_or_err,
-                    "is_primary": account_count == 1,
-                })
-                break
-            else:
-                _print_error(
-                    f"Ошибка подключения: {username_or_err}",
-                    hint="Проверь golden_key — он должен быть актуальным.",
-                )
-                retry = Confirm.ask("  Попробовать снова?", default=True)
-                if not retry:
-                    break
-
-        if multi_mode and account_count < max_accounts:
-            add_more = Confirm.ask(
-                f"\nДобавить ещё аккаунт? (добавлено {account_count}/{max_accounts})",
-                default=False,
-            )
-            if not add_more:
+        # Предлагаем добавить следующий аккаунт (только если лимит не достигнут)
+        if idx < max_accounts:
+            if not Confirm.ask("  Добавить следующий аккаунт?", default=True):
                 break
 
-        if not multi_mode:
-            break
-        account_count += 1
+    if not accounts_data:
+        _err("Не добавлено ни одного аккаунта. Настройка прервана.")
+        return
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 3 — Telegram
-    # ─────────────────────────────────────────────────────────────────────────
-    _print_step(3, total_steps, "Telegram")
+    # Обновляем max_accounts под реальное количество добавленных
+    cfg["max_accounts"] = len(accounts_data)
 
-    _print_info(
-        "Где получить токен бота:\n"
-        "   Telegram → @BotFather → /newbot"
-    )
-    _print_info(
-        "Где получить chat_id:\n"
-        "   Telegram → @userinfobot → /start"
+    # ── Шаг 3: Telegram ──────────────────────────────────────────────────────
+    _step(3, TOTAL, "Telegram — главный бот")
+
+    need_tg = Confirm.ask(
+        "Настроить главный Telegram-бот для управления?",
+        default=(len(accounts_data) > 1),
     )
 
-    if multi_mode:
-        console.print("\nНужен ли главный бот для управления всеми аккаунтами?")
-        console.print("[bold cyan][1][/bold cyan] Да — создам отдельный главный бот")
-        console.print("[bold cyan][2][/bold cyan] Нет — использовать бота первого аккаунта")
-        tg_mode = Prompt.ask("Выбор", choices=["1", "2"], default="2")
-        use_main_bot = (tg_mode == "1")
-    else:
-        use_main_bot = False
+    cfg["main_telegram_token"] = ""
+    cfg["main_telegram_chat_id"] = ""
 
-    main_tg_token = ""
-    main_tg_chat_id = ""
+    if need_tg:
+        token = Prompt.ask("  MAIN_TELEGRAM_TOKEN").strip()
+        chat_id_raw = Prompt.ask("  MAIN_TELEGRAM_CHAT_ID (числовой)").strip()
 
-    if use_main_bot or not multi_mode:
-        while True:
-            main_tg_token = Prompt.ask("  Токен Telegram бота").strip()
-            main_tg_chat_id = Prompt.ask("  Твой Telegram chat_id").strip()
+        # Валидация chat_id
+        try:
+            chat_id = int(chat_id_raw)
+        except ValueError:
+            _err(f"MAIN_TELEGRAM_CHAT_ID должен быть числом, получено: '{chat_id_raw}'")
+            _warn("Telegram не настроен. Можно задать вручную в .env позже.")
+            token = ""
+            chat_id = 0
 
-            console.print("  [dim]Отправка тестового сообщения...[/dim]")
-            tg_ok = await _check_telegram(main_tg_token, main_tg_chat_id)
-
+        if token and chat_id:
+            console.print("  [dim]Проверка Telegram...[/dim]")
+            tg_ok = await _check_telegram(token, chat_id)
             if tg_ok:
-                _print_success("Telegram подключён!")
-                break
+                _ok("Telegram OK — тестовое сообщение отправлено.")
             else:
-                retry = Confirm.ask("  Попробовать снова?", default=True)
-                if not retry:
-                    break
+                _warn("Telegram проверка не прошла. Токен сохранён — проверь вручную.")
 
-    env_config["main_telegram_token"] = main_tg_token
-    env_config["main_telegram_chat_id"] = main_tg_chat_id
+            cfg["main_telegram_token"] = token
+            cfg["main_telegram_chat_id"] = chat_id
 
-    # Для каждого аккаунта — отдельный бот или главный?
-    if multi_mode:
-        for i, acc in enumerate(accounts_data):
-            if i == 0 and not use_main_bot:
-                # Первый аккаунт = основной бот
-                continue
+    # ── Шаг 4: Запись .env + Encryption + БД ─────────────────────────────────
+    _step(4, TOTAL, "Создание .env, ключа шифрования и БД")
 
-            console.print(f"\n[bold white]{acc['name']}[/bold white] — настройка бота:")
-            console.print("[bold cyan][1][/bold cyan] Отдельный бот")
-            console.print("[bold cyan][2][/bold cyan] Использовать главный бот")
-            bot_choice = Prompt.ask("Выбор", choices=["1", "2"], default="2")
+    _save_env(cfg)
+    _ok(f".env создан: {ENV_FILE}")
 
-            if bot_choice == "1":
-                acc_token = Prompt.ask("  Токен отдельного бота").strip()
-                acc_chat_id = Prompt.ask("  chat_id владельца").strip()
-                acc["telegram_token"] = acc_token
-                acc["owner_chat_id"] = acc_chat_id
-            else:
-                acc["telegram_token"] = None
-                acc["owner_chat_id"] = main_tg_chat_id
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 4 — Инициализация системы
-    # ─────────────────────────────────────────────────────────────────────────
-    _print_step(4, total_steps, "Инициализация системы")
-
-    # Сохраняем .env
-    _save_env(env_config)
-    _print_success(f".env создан: {ENV_FILE}")
-
-    # Инициализируем шифрование
+    # Encryption
     try:
         from modules.core.encryption import Encryption
-        Encryption()
-        _print_success("Ключ шифрования создан: data/secret.key")
-    except Exception as exc:
-        _print_error(f"Ошибка создания ключа шифрования: {exc}")
 
-    # Инициализируем БД
+        Encryption()
+        _ok("Ключ шифрования: data/secret.key")
+    except Exception as exc:
+        _err(f"Encryption: {exc}")
+        return
+
+    # DB
     try:
         from modules.core.database import init_db
-        await init_db()
-        _print_success("База данных создана: data/cardinal_multi.db")
-    except Exception as exc:
-        _print_error(f"Ошибка создания БД: {exc}")
 
-    # Сохраняем аккаунты в БД
+        await init_db()
+        _ok("База данных: data/cardinal_multi.db")
+    except Exception as exc:
+        _err(f"Ошибка создания БД: {exc}")
+        return
+
+    # Сохранение аккаунтов в БД
     try:
         from modules.core.database import get_session
         from modules.multi.models.account import Account as AccountModel
-        from modules.core.encryption import Encryption
 
-        enc = Encryption()
-
+        saved = 0
         async with get_session() as session:
-            for acc_data in accounts_data:
+            for acc in accounts_data:
                 model = AccountModel()
-                model.name = acc_data["name"]
-                model.funpay_username = acc_data.get("username")
-                model.set_golden_key(acc_data["golden_key"])
-                model.is_primary = acc_data.get("is_primary", False)
+                model.name = acc["name"]
+                model.funpay_username = acc.get("username")
+                model.is_primary = bool(acc.get("is_primary", False))
                 model.is_active = True
-                model.owner_chat_id = acc_data.get(
-                    "owner_chat_id", main_tg_chat_id
+                model.owner_chat_id = (
+                    str(cfg["main_telegram_chat_id"])
+                    if cfg.get("main_telegram_chat_id")
+                    else None
                 )
-
-                tg_token = acc_data.get("telegram_token")
-                if tg_token:
-                    model.set_telegram_token(tg_token)
-
+                model.set_golden_key(acc["golden_key"])
                 session.add(model)
+                saved += 1
 
-        _print_success(f"Сохранено {len(accounts_data)} аккаунт(ов) в БД.")
-
+        _ok(f"Сохранено аккаунтов в БД: {saved}")
     except Exception as exc:
-        _print_error(f"Ошибка сохранения аккаунтов: {exc}")
+        _err(f"Ошибка сохранения аккаунтов: {exc}")
+        return
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 5 — Итог
-    # ─────────────────────────────────────────────────────────────────────────
-    _print_step(5, total_steps, "Итог")
+    # ── Шаг 5: Итог ──────────────────────────────────────────────────────────
+    _step(5, TOTAL, "Готово!")
 
+    console.print("\n[bold green]Настройка завершена успешно![/bold green]\n")
+    console.print("Следующие шаги:")
+    console.print("  [cyan]1)[/cyan] Если нужен Lolzteam — заполни LOLZ_API_TOKEN в .env")
+    console.print("  [cyan]2)[/cyan] Запуск: [bold]python main.py[/bold]")
     console.print()
-    for acc in accounts_data:
-        username = f"@{acc['username']}" if acc.get("username") else acc["name"]
-        status = "основной" if acc.get("is_primary") else "дополнительный"
-        _print_success(f"{username} — подключён [{status}]")
-
-    if main_tg_token:
-        _print_success("Telegram — подключён")
-
-    _print_success("База данных — создана")
-    _print_success("Ключ шифрования — создан")
-
-    console.print()
-    console.print(Panel(
-        "[bold green]Настройка завершена![/bold green]\n\n"
-        "Запусти: [bold cyan]start.bat[/bold cyan] (Windows) "
-        "или [bold cyan]python main.py[/bold cyan] (Linux/Mac)",
-        box=box.ROUNDED,
-        border_style="green",
-    ))
 
 
 if __name__ == "__main__":
-    asyncio.run(run_setup())
+    try:
+        asyncio.run(run_setup())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Настройка прервана.[/yellow]")

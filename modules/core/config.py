@@ -1,13 +1,14 @@
 """
 modules/core/config.py
-──────────────────────
+
 Единая точка конфигурации Cardinal_Multi.
 
-Загружает:
-1. .env через pydantic-settings (наши настройки)
-2. Cardinal .cfg конфиги (configs/_main.cfg и др.) для read-only доступа
+Загружает настройки из .env через pydantic-settings.
+Дополнительно предоставляет read-only доступ к .cfg-файлам Cardinal.
 
-Все настройки валидируются Pydantic v2 при старте.
+Правила:
+- Используй get_settings() везде в коде — не создавай MultiSettings() напрямую.
+- Не импортируй этот модуль в __init__.py пакетов — избегай циклических импортов.
 """
 
 from __future__ import annotations
@@ -16,48 +17,26 @@ import configparser
 from pathlib import Path
 from typing import Optional
 
-from pydantic import field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from loguru import logger
+from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# ─── Cardinal CFG пути ────────────────────────────────────────────────────────
-CARDINAL_CONFIGS = {
+# ─── Пути к Cardinal .cfg ────────────────────────────────────────────────────
+CARDINAL_CONFIGS: dict[str, Path] = {
     "main":          Path("configs/_main.cfg"),
     "auto_response": Path("configs/auto_response.cfg"),
     "auto_delivery": Path("configs/auto_delivery.cfg"),
 }
 
 
-# ─── Pydantic модели настроек ─────────────────────────────────────────────────
-
-class AccountEnvConfig(BaseSettings):
-    """
-    Настройки одного аккаунта FunPay из .env.
-    Используется внутри MultiSettings.
-    """
-
-    model_config = SettingsConfigDict(extra="ignore")
-
-    golden_key: str
-    """Ключ авторизации FunPay."""
-
-    telegram_token: Optional[str] = None
-    """Токен Telegram-бота для этого аккаунта (опционально)."""
-
-    owner_chat_id: Optional[str] = None
-    """Telegram chat_id владельца аккаунта."""
-
-    is_primary: bool = False
-    """Является ли аккаунт основным."""
-
-
+# ─── Главный класс настроек ──────────────────────────────────────────────────
 class MultiSettings(BaseSettings):
     """
-    Главные настройки Cardinal_Multi из .env.
+    Настройки Cardinal_Multi, загружаемые из .env.
 
-    Все поля читаются из переменных окружения или файла .env.
-    Аккаунты хранятся в БД, здесь — только глобальные настройки.
+    Поддерживает backward-compatibility по именам ключей:
+    - LOLZ_API_TOKEN и LOLZTEAM_TOKEN — оба рабочих.
     """
 
     model_config = SettingsConfigDict(
@@ -67,89 +46,168 @@ class MultiSettings(BaseSettings):
         case_sensitive=False,
     )
 
-    # ── Общие настройки ───────────────────────────────────────────────────────
-    log_level: str = "DEBUG"
-    """Уровень логирования (DEBUG/INFO/WARNING/ERROR)."""
+    # ── Логирование ───────────────────────────────────────────────────────────
+    log_level: str = Field(
+        default="INFO",
+        validation_alias=AliasChoices("LOG_LEVEL"),
+        description="Уровень логирования: DEBUG | INFO | WARNING | ERROR | CRITICAL",
+    )
 
-    max_accounts: int = 5
-    """Максимальное количество аккаунтов FunPay."""
+    # ── Мультиаккаунты ────────────────────────────────────────────────────────
+    max_accounts: int = Field(
+        default=5,
+        validation_alias=AliasChoices("MAX_ACCOUNTS"),
+        description="Макс. количество аккаунтов FunPay (1..5, лимит AccountManager).",
+    )
+    request_delay: float = Field(
+        default=1.0,
+        validation_alias=AliasChoices("REQUEST_DELAY"),
+        description="Задержка между запросами к FunPay API (секунды).",
+    )
 
-    request_delay: float = 6.0
-    """Задержка между запросами к FunPay API (секунды)."""
+    # ── Telegram ──────────────────────────────────────────────────────────────
+    main_telegram_token: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("MAIN_TELEGRAM_TOKEN"),
+        description="Токен главного Telegram-бота управления.",
+    )
+    # ВАЖНО: chat_id — int, не str.
+    # В .env пишется как число: MAIN_TELEGRAM_CHAT_ID=123456789
+    main_telegram_chat_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("MAIN_TELEGRAM_CHAT_ID"),
+        description="Chat ID владельца для уведомлений от всех модулей.",
+    )
 
-    # ── Главный Telegram-бот (опционально) ───────────────────────────────────
-    main_telegram_token: Optional[str] = None
-    """Токен главного Telegram-бота для управления всеми аккаунтами."""
+    # ── Мониторинг баланса ────────────────────────────────────────────────────
+    balance_alert_threshold: float = Field(
+        default=100.0,
+        validation_alias=AliasChoices("BALANCE_ALERT_THRESHOLD"),
+        description="Порог баланса FunPay для уведомления (рубли, >= 0).",
+    )
 
-    main_telegram_chat_id: Optional[str] = None
-    """Chat ID владельца для главного бота."""
+    # ── AI (опционально) ──────────────────────────────────────────────────────
+    openai_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("OPENAI_API_KEY"),
+    )
 
-    # ── Database ──────────────────────────────────────────────────────────────
-    db_path: str = "data/cardinal_multi.db"
-    """Путь к файлу SQLite БД."""
+    # ── Lolzteam ──────────────────────────────────────────────────────────────
+    # Основной ключ: LOLZ_API_TOKEN (соответствует .env.example)
+    # Back-compat:   LOLZTEAM_TOKEN (старые установки)
+    lolz_api_token: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LOLZ_API_TOKEN", "LOLZTEAM_TOKEN"),
+        description="Bearer-токен Lolzteam Market API.",
+    )
+    lolz_login: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LOLZ_LOGIN"),
+        description="Логин lzt.market (Playwright режим).",
+    )
+    lolz_password: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LOLZ_PASSWORD"),
+        description="Пароль lzt.market (Playwright режим).",
+    )
+    lolz_client_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LOLZ_CLIENT_ID"),
+    )
+    lolz_client_secret: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LOLZ_CLIENT_SECRET"),
+    )
+    lolz_secret_phrase: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LOLZ_SECRET_PHRASE"),
+    )
 
-    # ── Lolzteam (для другого AI-модуля) ─────────────────────────────────────
-    lolzteam_token: Optional[str] = None
-    """API-токен Lolzteam (заполняется другим модулем)."""
+    # ── Свойства обратной совместимости ───────────────────────────────────────
+    @property
+    def lolzteam_token(self) -> Optional[str]:
+        """Алиас: старый код может обращаться к settings.lolzteam_token."""
+        return self.lolz_api_token
 
-    # ── AI консультант (для другого AI-модуля) ───────────────────────────────
-    openai_api_key: Optional[str] = None
-    """OpenAI API ключ (заполняется другим модулем)."""
+    @property
+    def has_lolz(self) -> bool:
+        """True если задан хотя бы один способ авторизации в Lolzteam."""
+        return bool(self.lolz_api_token or (self.lolz_login and self.lolz_password))
 
-    # ── Уведомления ──────────────────────────────────────────────────────────
-    balance_alert_threshold: float = 100.0
-    """Порог баланса (ниже которого — уведомление BALANCE_LOW)."""
+    @property
+    def lolz_mode(self) -> str:
+        """Определяет режим Lolzteam: 'api' | 'playwright' | 'none'."""
+        if self.lolz_api_token:
+            return "api"
+        if self.lolz_login and self.lolz_password:
+            return "playwright"
+        return "none"
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Валидаторы
-    # ─────────────────────────────────────────────────────────────────────────
-
+    # ── Валидаторы ────────────────────────────────────────────────────────────
     @field_validator("log_level")
     @classmethod
-    def validate_log_level(cls, v: str) -> str:
+    def _validate_log_level(cls, v: str) -> str:
         allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-        upper = v.upper()
+        upper = v.strip().upper()
         if upper not in allowed:
-            raise ValueError(f"LOG_LEVEL должен быть одним из: {allowed}")
+            raise ValueError(
+                f"LOG_LEVEL='{v}' недопустим. "
+                f"Допустимые значения: {', '.join(sorted(allowed))}"
+            )
         return upper
 
     @field_validator("max_accounts")
     @classmethod
-    def validate_max_accounts(cls, v: int) -> int:
+    def _validate_max_accounts(cls, v: int) -> int:
+        # Синхронизировано с AccountManager.MAX_ACCOUNTS = 5
         if not 1 <= v <= 5:
-            raise ValueError("MAX_ACCOUNTS должен быть от 1 до 5.")
+            raise ValueError(
+                f"MAX_ACCOUNTS={v} выходит за пределы 1..5. "
+                f"AccountManager поддерживает максимум 5 аккаунтов."
+            )
         return v
 
     @field_validator("request_delay")
     @classmethod
-    def validate_request_delay(cls, v: float) -> float:
-        if v < 1.0:
-            raise ValueError("REQUEST_DELAY не может быть меньше 1 секунды.")
+    def _validate_request_delay(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError(
+                f"REQUEST_DELAY={v} не может быть отрицательным."
+            )
+        return v
+
+    @field_validator("balance_alert_threshold")
+    @classmethod
+    def _validate_balance_threshold(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError(
+                f"BALANCE_ALERT_THRESHOLD={v} не может быть отрицательным."
+            )
         return v
 
     @model_validator(mode="after")
-    def validate_telegram_consistency(self) -> "MultiSettings":
-        """Если указан main_telegram_token — должен быть и chat_id."""
+    def _validate_telegram_pair(self) -> "MultiSettings":
+        """
+        Предупреждаем (не падаем!) если задан только токен без chat_id.
+        Падать здесь слишком строго — пользователь мог не дочитать .env.
+        """
         if self.main_telegram_token and not self.main_telegram_chat_id:
-            raise ValueError(
-                "MAIN_TELEGRAM_CHAT_ID обязателен при наличии MAIN_TELEGRAM_TOKEN."
+            logger.warning(
+                "MAIN_TELEGRAM_TOKEN задан, но MAIN_TELEGRAM_CHAT_ID пустой. "
+                "Уведомления Telegram работать не будут."
             )
         return self
 
 
-# ─── Загрузчик Cardinal .cfg конфигов ─────────────────────────────────────────
-
+# ─── CardinalConfigReader ────────────────────────────────────────────────────
 class CardinalConfigReader:
     """
-    Read-only доступ к .cfg конфигам Cardinal.
+    Read-only доступ к .cfg файлам Cardinal (INI-формат).
 
-    Не модифицирует файлы Cardinal.
-    Используется для чтения настроек (например, requestsDelay).
-
-    Пример::
-
+    Пример:
         reader = CardinalConfigReader()
         delay = reader.get("main", "Other", "requestsDelay", fallback="6")
+        auto_response_on = reader.getboolean("auto_response", "Settings", "Enabled", fallback=False)
     """
 
     def __init__(self) -> None:
@@ -157,15 +215,17 @@ class CardinalConfigReader:
         self._load_all()
 
     def _load_all(self) -> None:
-        """Загружает все доступные Cardinal .cfg файлы."""
         for name, path in CARDINAL_CONFIGS.items():
-            if path.exists():
-                parser = configparser.ConfigParser()
+            if not path.exists():
+                logger.debug("Cardinal cfg не найден (пропуск): {}", path)
+                continue
+            parser = configparser.ConfigParser()
+            try:
                 parser.read(str(path), encoding="utf-8")
                 self._configs[name] = parser
-                logger.debug("Cardinal cfg загружен: {} ({})", name, path)
-            else:
-                logger.debug("Cardinal cfg не найден (пропуск): {}", path)
+                logger.debug("Cardinal cfg загружен: {} → {}", name, path)
+            except configparser.Error as exc:
+                logger.error("Ошибка чтения Cardinal cfg '{}': {}", path, exc)
 
     def get(
         self,
@@ -174,15 +234,6 @@ class CardinalConfigReader:
         key: str,
         fallback: str | None = None,
     ) -> str | None:
-        """
-        Возвращает значение из Cardinal .cfg конфига.
-
-        :param config_name: имя конфига ("main", "auto_response", "auto_delivery").
-        :param section: секция конфига.
-        :param key: ключ в секции.
-        :param fallback: значение по умолчанию если не найдено.
-        :return: строковое значение или fallback.
-        """
         cfg = self._configs.get(config_name)
         if cfg is None:
             return fallback
@@ -195,65 +246,65 @@ class CardinalConfigReader:
         key: str,
         fallback: bool = False,
     ) -> bool:
-        """
-        Возвращает булево значение из Cardinal .cfg конфига.
-
-        :param config_name: имя конфига.
-        :param section: секция конфига.
-        :param key: ключ в секции.
-        :param fallback: значение по умолчанию.
-        :return: bool значение.
-        """
         cfg = self._configs.get(config_name)
         if cfg is None:
             return fallback
         return cfg.getboolean(section, key, fallback=fallback)
 
+    def getint(
+        self,
+        config_name: str,
+        section: str,
+        key: str,
+        fallback: int = 0,
+    ) -> int:
+        cfg = self._configs.get(config_name)
+        if cfg is None:
+            return fallback
+        return cfg.getint(section, key, fallback=fallback)
+
     def has_config(self, config_name: str) -> bool:
-        """Проверяет, загружен ли конфиг с таким именем."""
         return config_name in self._configs
 
     def reload(self) -> None:
-        """Перезагружает все конфиги с диска."""
         self._configs.clear()
         self._load_all()
-        logger.debug("Cardinal cfg конфиги перезагружены.")
+        logger.info("Cardinal cfg конфиги перезагружены.")
 
 
-# ─── Глобальный доступ ────────────────────────────────────────────────────────
-
+# ─── Синглтоны ───────────────────────────────────────────────────────────────
 _settings: MultiSettings | None = None
 _cardinal_cfg: CardinalConfigReader | None = None
 
 
 def get_settings() -> MultiSettings:
     """
-    Возвращает глобальный экземпляр настроек.
-    Загружает из .env при первом вызове.
+    Возвращает глобальный экземпляр настроек Cardinal_Multi.
 
-    :return: MultiSettings instance.
-    :raises SystemExit: если .env не найден или настройки невалидны.
+    При первом вызове читает .env.
+    При ошибке конфигурации — завершает процесс с понятным сообщением.
     """
     global _settings
     if _settings is None:
         try:
             _settings = MultiSettings()
-            logger.debug("Настройки Cardinal_Multi загружены из .env")
+            logger.debug(
+                "Настройки загружены: log_level={}, max_accounts={}, lolz_mode={}",
+                _settings.log_level,
+                _settings.max_accounts,
+                _settings.lolz_mode,
+            )
         except Exception as exc:
-            logger.error("Ошибка загрузки настроек: {}", exc)
+            logger.critical("Критическая ошибка конфигурации: {}", exc)
             raise SystemExit(
-                f"❌ Ошибка конфигурации: {exc}\n"
-                f"   Проверь файл .env (шаблон: .env.example)"
+                f"\n❌ Ошибка конфигурации:\n{exc}\n\n"
+                f"Проверь файл .env (шаблон: .env.example)\n"
             ) from exc
     return _settings
 
 
 def get_cardinal_cfg() -> CardinalConfigReader:
-    """
-    Возвращает глобальный reader Cardinal .cfg конфигов.
-
-    :return: CardinalConfigReader instance.
-    """
+    """Возвращает глобальный читатель Cardinal .cfg файлов."""
     global _cardinal_cfg
     if _cardinal_cfg is None:
         _cardinal_cfg = CardinalConfigReader()
@@ -261,12 +312,7 @@ def get_cardinal_cfg() -> CardinalConfigReader:
 
 
 def reload_settings() -> MultiSettings:
-    """
-    Принудительно перезагружает настройки из .env.
-    Использовать после изменения .env файла.
-
-    :return: новый MultiSettings instance.
-    """
+    """Сбрасывает кэш и перечитывает .env. Полезно в тестах."""
     global _settings
     _settings = None
     return get_settings()
