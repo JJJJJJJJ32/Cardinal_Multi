@@ -1,0 +1,24 @@
+[tool.bandit]
+exclude_dirs = [
+  "tests",
+  "venv",
+  ".venv",
+  "env",
+  ".git",
+  "__pycache__",
+  "dist",
+  "build",
+  "*.egg-info",
+  "FunPayCardinal",
+]
+
+# Скипы — только то, что массово даёт шум именно в таких проектах.
+# Если хочешь “максимально строго” — сокращай список.
+skips = [
+  "B101", # assert_used
+  "B105", # hardcoded_password_string
+  "B106", # hardcoded_password_funcarg
+  "B107", # hardcoded_password_default
+  "B311", # random (если используется не для криптографии)
+  "B324", # md5/sha1 (если нужен для совместимости API, не для паролей)
+]

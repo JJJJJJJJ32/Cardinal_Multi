@@ -1,0 +1,7 @@
+^\.env\.example$
+^\.env\.sample$
+^README\.md$
+^CHANGELOG\.md$
+^docs/
+^tests/
+^.*\.md$

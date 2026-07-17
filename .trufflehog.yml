@@ -1,0 +1,10 @@
+# .trufflehog.yml (doc/notes)
+# Этот файл НЕ обязателен для GitHub Action.
+# Реальные исключения применяются через .trufflehogignore + флаг:
+#   --exclude-paths .trufflehogignore
+
+notes:
+  why_exclude_env_example: "В .env.example могут быть плейсхолдеры, похожие на токены"
+  why_exclude_markdown: "В markdown иногда встречаются примеры ключей/токенов, создающие шум"
+
+exclude_paths_file: ".trufflehogignore"
